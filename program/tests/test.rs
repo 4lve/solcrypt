@@ -13,6 +13,7 @@ use light_sdk::instruction::{PackedAccounts, SystemAccountMetaConfig};
 use sha2::{Digest, Sha256};
 use solana_sdk::{
     instruction::{AccountMeta, Instruction},
+    native_token::LAMPORTS_PER_SOL,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
 };
@@ -178,23 +179,51 @@ async fn test_solcrypt_dm() {
     println!("  ✓ X25519 key exchange verified");
 
     // ========================================================================
-    // Test 1: Initialize User Account (sender)
+    // Test 1a: Initialize User Account (sender)
     // ========================================================================
-    println!("Test 1: Initialize sender's UserAccount...");
+    println!("Test 1a: Initialize sender's UserAccount...");
     init_user(&payer, &mut rpc, sender_x25519_public.to_bytes())
         .await
         .unwrap();
 
     // Verify the user account was created
-    let (user_pda, _bump) = get_user_pda(&payer.pubkey(), &program_id);
-    let user_account_data = rpc.get_account(user_pda).await.unwrap().unwrap();
+    let (sender_pda, _bump) = get_user_pda(&payer.pubkey(), &program_id);
+    let user_account_data = rpc.get_account(sender_pda).await.unwrap().unwrap();
     let user_account = UserAccount::deserialize(&mut &user_account_data.data[..]).unwrap();
     assert_eq!(user_account.x25519_pubkey, sender_x25519_public.to_bytes());
     assert!(user_account.threads.is_empty());
     println!("  ✓ Sender UserAccount created with X25519 pubkey");
 
     // ========================================================================
-    // Test 2: Send Encrypted DM Message
+    // Test 1b: Initialize User Account (recipient)
+    // ========================================================================
+    println!("Test 1b: Initialize recipient's UserAccount...");
+
+    rpc.airdrop_lamports(&recipient_keypair.pubkey(), LAMPORTS_PER_SOL)
+        .await
+        .unwrap();
+
+    // Fund recipient so they can pay for their own init (in real scenario)
+    init_user(
+        &recipient_keypair,
+        &mut rpc,
+        recipient_x25519_public.to_bytes(),
+    )
+    .await
+    .unwrap();
+
+    let (recipient_pda, _) = get_user_pda(&recipient_keypair.pubkey(), &program_id);
+    let recipient_account_data = rpc.get_account(recipient_pda).await.unwrap().unwrap();
+    let recipient_account =
+        UserAccount::deserialize(&mut &recipient_account_data.data[..]).unwrap();
+    assert_eq!(
+        recipient_account.x25519_pubkey,
+        recipient_x25519_public.to_bytes()
+    );
+    println!("  ✓ Recipient UserAccount created with X25519 pubkey");
+
+    // ========================================================================
+    // Test 2: Send Encrypted DM Message (auto-adds threads to both accounts)
     // ========================================================================
     println!("Test 2: Send encrypted DM message...");
 
@@ -266,21 +295,8 @@ async fn test_solcrypt_dm() {
     println!("  ✓ Message encrypted and stored on-chain");
     println!("  ✓ Recipient decrypted: {:?}", decrypted_message);
 
-    // ========================================================================
-    // Test 3: Add thread to sender's list (accepted state)
-    // ========================================================================
-    println!("Test 3: Add thread to sender's list...");
-    add_thread(
-        &payer,
-        &mut rpc,
-        thread_id,
-        solcrypt_program::THREAD_STATE_ACCEPTED,
-    )
-    .await
-    .unwrap();
-
-    // Verify thread was added
-    let user_account_data = rpc.get_account(user_pda).await.unwrap().unwrap();
+    // Verify thread was auto-added to sender's list (ACCEPTED)
+    let user_account_data = rpc.get_account(sender_pda).await.unwrap().unwrap();
     let user_account = UserAccount::deserialize(&mut &user_account_data.data[..]).unwrap();
     assert_eq!(user_account.threads.len(), 1);
     assert_eq!(user_account.threads[0].thread_id, thread_id);
@@ -288,59 +304,89 @@ async fn test_solcrypt_dm() {
         user_account.threads[0].state,
         solcrypt_program::THREAD_STATE_ACCEPTED
     );
-    println!("  ✓ Thread added to sender's list");
+    println!("  ✓ Thread auto-added to sender's list (ACCEPTED)");
+
+    // Verify thread was auto-added to recipient's list (PENDING)
+    let recipient_account_data = rpc.get_account(recipient_pda).await.unwrap().unwrap();
+    let recipient_account =
+        UserAccount::deserialize(&mut &recipient_account_data.data[..]).unwrap();
+    assert_eq!(recipient_account.threads.len(), 1);
+    assert_eq!(recipient_account.threads[0].thread_id, thread_id);
+    assert_eq!(
+        recipient_account.threads[0].state,
+        solcrypt_program::THREAD_STATE_PENDING
+    );
+    println!("  ✓ Thread auto-added to recipient's list (PENDING)");
 
     // ========================================================================
-    // Test 4: Add Thread as pending (simulating a different conversation)
+    // Test 3: Recipient accepts the thread (DM request flow)
     // ========================================================================
-    println!("Test 4: Add pending thread...");
-    let pending_thread_id = compute_thread_id(&payer.pubkey(), &third_user_keypair.pubkey());
+    println!("Test 3: Recipient accepts thread...");
+    accept_thread_for(&payer, &recipient_keypair, &mut rpc, thread_id)
+        .await
+        .unwrap();
+
+    // Verify thread was accepted
+    let recipient_account_data = rpc.get_account(recipient_pda).await.unwrap().unwrap();
+    let recipient_account =
+        UserAccount::deserialize(&mut &recipient_account_data.data[..]).unwrap();
+    assert_eq!(
+        recipient_account.threads[0].state,
+        solcrypt_program::THREAD_STATE_ACCEPTED
+    );
+    println!("  ✓ Recipient accepted the DM request");
+
+    // ========================================================================
+    // Test 4: Manual add thread (for testing add_thread separately)
+    // ========================================================================
+    println!("Test 4: Add another thread manually...");
+    let manual_thread_id = compute_thread_id(&payer.pubkey(), &third_user_keypair.pubkey());
     add_thread(
         &payer,
         &mut rpc,
-        pending_thread_id,
+        manual_thread_id,
         solcrypt_program::THREAD_STATE_PENDING,
     )
     .await
     .unwrap();
 
-    // Verify pending thread was added
-    let user_account_data = rpc.get_account(user_pda).await.unwrap().unwrap();
+    // Verify thread was added
+    let user_account_data = rpc.get_account(sender_pda).await.unwrap().unwrap();
     let user_account = UserAccount::deserialize(&mut &user_account_data.data[..]).unwrap();
     assert_eq!(user_account.threads.len(), 2);
     assert_eq!(
         user_account.threads[1].state,
         solcrypt_program::THREAD_STATE_PENDING
     );
-    println!("  ✓ Pending thread added");
+    println!("  ✓ Manual thread added");
 
     // ========================================================================
-    // Test 5: Accept Thread
+    // Test 5: Accept the manually added thread
     // ========================================================================
-    println!("Test 5: Accept pending thread...");
-    accept_thread(&payer, &mut rpc, pending_thread_id)
+    println!("Test 5: Accept manual thread...");
+    accept_thread(&payer, &mut rpc, manual_thread_id)
         .await
         .unwrap();
 
     // Verify thread was accepted
-    let user_account_data = rpc.get_account(user_pda).await.unwrap().unwrap();
+    let user_account_data = rpc.get_account(sender_pda).await.unwrap().unwrap();
     let user_account = UserAccount::deserialize(&mut &user_account_data.data[..]).unwrap();
     assert_eq!(
         user_account.threads[1].state,
         solcrypt_program::THREAD_STATE_ACCEPTED
     );
-    println!("  ✓ Thread accepted");
+    println!("  ✓ Manual thread accepted");
 
     // ========================================================================
     // Test 6: Remove Thread
     // ========================================================================
     println!("Test 6: Remove thread...");
-    remove_thread(&payer, &mut rpc, pending_thread_id)
+    remove_thread(&payer, &mut rpc, manual_thread_id)
         .await
         .unwrap();
 
     // Verify thread was removed
-    let user_account_data = rpc.get_account(user_pda).await.unwrap().unwrap();
+    let user_account_data = rpc.get_account(sender_pda).await.unwrap().unwrap();
     let user_account = UserAccount::deserialize(&mut &user_account_data.data[..]).unwrap();
     assert_eq!(user_account.threads.len(), 1);
     assert_eq!(user_account.threads[0].thread_id, thread_id);
@@ -355,18 +401,18 @@ async fn test_solcrypt_dm() {
 
 /// Initialize a user account PDA with X25519 public key
 pub async fn init_user(
-    payer: &Keypair,
+    user: &Keypair,
     rpc: &mut LightProgramTest,
     x25519_pubkey: [u8; 32],
 ) -> Result<(), RpcError> {
     let program_id: Pubkey = solcrypt_program::ID.into();
-    let (user_pda, _bump) = get_user_pda(&payer.pubkey(), &program_id);
+    let (user_pda, _bump) = get_user_pda(&user.pubkey(), &program_id);
 
     let instruction_data = InitUserData { x25519_pubkey };
     let inputs = instruction_data.try_to_vec().unwrap();
 
     let accounts = vec![
-        AccountMeta::new(payer.pubkey(), true),
+        AccountMeta::new(user.pubkey(), true),
         AccountMeta::new(user_pda, false),
         AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
     ];
@@ -377,12 +423,43 @@ pub async fn init_user(
         data: [&[InstructionType::InitUser as u8][..], &inputs[..]].concat(),
     };
 
-    rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer])
+    rpc.create_and_send_transaction(&[instruction], &user.pubkey(), &[user])
+        .await?;
+    Ok(())
+}
+
+/// Accept a thread for a different user (funded by payer)
+pub async fn accept_thread_for(
+    _funder: &Keypair,
+    user: &Keypair,
+    rpc: &mut LightProgramTest,
+    thread_id: [u8; 32],
+) -> Result<(), RpcError> {
+    let program_id: Pubkey = solcrypt_program::ID.into();
+    let (user_pda, _bump) = get_user_pda(&user.pubkey(), &program_id);
+
+    let instruction_data = AcceptThreadData { thread_id };
+    let inputs = instruction_data.try_to_vec().unwrap();
+
+    let accounts = vec![
+        AccountMeta::new(user.pubkey(), true),
+        AccountMeta::new(user_pda, false),
+    ];
+
+    let instruction = Instruction {
+        program_id,
+        accounts,
+        data: [&[InstructionType::AcceptThread as u8][..], &inputs[..]].concat(),
+    };
+
+    // User signs
+    rpc.create_and_send_transaction(&[instruction], &user.pubkey(), &[user])
         .await?;
     Ok(())
 }
 
 /// Send a DM message (creates compressed MsgV1 account)
+/// Also adds thread to both sender and recipient UserAccounts
 pub async fn send_dm_message(
     payer: &Keypair,
     rpc: &mut LightProgramTest,
@@ -395,10 +472,16 @@ pub async fn send_dm_message(
     ciphertext: Vec<u8>,
     nonce: [u8; 32],
 ) -> Result<(), RpcError> {
-    let system_account_meta_config = SystemAccountMetaConfig::new(solcrypt_program::ID.into());
-    let mut accounts = PackedAccounts::default();
-    accounts.add_pre_accounts_signer(payer.pubkey());
-    accounts.add_system_accounts(system_account_meta_config)?;
+    let program_id: Pubkey = solcrypt_program::ID.into();
+
+    // Get user PDAs
+    let (sender_user_pda, _) = get_user_pda(&payer.pubkey(), &program_id);
+    let (recipient_user_pda, _) = get_user_pda(&recipient, &program_id);
+
+    let system_account_meta_config = SystemAccountMetaConfig::new(program_id);
+    let mut packed_accounts = PackedAccounts::default();
+    packed_accounts.add_pre_accounts_signer(payer.pubkey());
+    packed_accounts.add_system_accounts(system_account_meta_config)?;
 
     let rpc_result = rpc
         .get_validity_proof(
@@ -412,9 +495,25 @@ pub async fn send_dm_message(
         .await?
         .value;
 
-    let output_merkle_tree_index = accounts.insert_or_get(*merkle_tree_pubkey);
-    let packed_address_tree_info = rpc_result.pack_tree_infos(&mut accounts).address_trees[0];
-    let (accounts, _, _) = accounts.to_account_metas();
+    let output_merkle_tree_index = packed_accounts.insert_or_get(*merkle_tree_pubkey);
+    let packed_address_tree_info = rpc_result
+        .pack_tree_infos(&mut packed_accounts)
+        .address_trees[0];
+    let (light_accounts, _, _) = packed_accounts.to_account_metas();
+
+    // Build final account list:
+    // [0] = signer (from light_accounts[0])
+    // [1] = sender_user_pda
+    // [2] = recipient_user_pda
+    // [3] = system_program
+    // [4..] = Light Protocol accounts (light_accounts[1..])
+    let mut accounts = vec![
+        light_accounts[0].clone(), // signer
+        AccountMeta::new(sender_user_pda, false),
+        AccountMeta::new(recipient_user_pda, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    accounts.extend(light_accounts[1..].iter().cloned());
 
     let instruction_data = SendDmMessageData {
         proof: rpc_result.proof,
@@ -429,7 +528,7 @@ pub async fn send_dm_message(
     let inputs = instruction_data.try_to_vec().unwrap();
 
     let instruction = Instruction {
-        program_id: solcrypt_program::ID.into(),
+        program_id,
         accounts,
         data: [&[InstructionType::SendDmMessage as u8][..], &inputs[..]].concat(),
     };

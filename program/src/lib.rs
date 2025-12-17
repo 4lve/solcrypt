@@ -163,6 +163,9 @@ impl TryFrom<u8> for InstructionType {
 /// Instruction data for sending a DM message (creates compressed MsgV1 leaf)
 #[derive(BorshSerialize, BorshDeserialize, CodamaInstruction)]
 #[codama(account(name = "signer", signer, writable))]
+#[codama(account(name = "sender_user_account", writable))]
+#[codama(account(name = "recipient_user_account", writable))]
+#[codama(account(name = "system_program"))]
 pub struct SendDmMessageData {
     /// ZK validity proof
     pub proof: ValidityProof,
@@ -172,7 +175,7 @@ pub struct SendDmMessageData {
     pub output_state_tree_index: u8,
     /// Thread ID (sha256 of participants)
     pub thread_id: [u8; 32],
-    /// Message recipient
+    /// Message recipient pubkey (for deriving their PDA)
     pub recipient: Pubkey,
     /// AES-GCM initialization vector
     pub iv: [u8; 12],
@@ -242,6 +245,10 @@ pub enum SolcryptError {
     InvalidPda,
     #[codama(error("User account already initialized"))]
     UserAlreadyInitialized,
+    #[codama(error("Sender has not initialized their user account"))]
+    UserNotInitialized,
+    #[codama(error("Recipient has not initialized their user account"))]
+    RecipientNotInitialized,
 }
 
 impl From<SolcryptError> for ProgramError {
@@ -254,6 +261,8 @@ impl From<SolcryptError> for ProgramError {
             SolcryptError::MessageTooLarge => ProgramError::Custom(5),
             SolcryptError::InvalidPda => ProgramError::Custom(6),
             SolcryptError::UserAlreadyInitialized => ProgramError::Custom(7),
+            SolcryptError::UserNotInitialized => ProgramError::Custom(8),
+            SolcryptError::RecipientNotInitialized => ProgramError::Custom(9),
         }
     }
 }
@@ -273,6 +282,74 @@ fn to_custom_error_u32<E: Into<u32>>(e: E) -> ProgramError {
 /// Derives the UserAccount PDA address
 pub fn get_user_pda(user: &Pubkey, program_id: &Pubkey) -> (Pubkey, u8) {
     pinocchio::pubkey::find_program_address(&[USER_SEED, user.as_ref()], program_id)
+}
+
+/// Helper to add a thread to a UserAccount PDA.
+/// Handles resize if needed. Skips if thread already exists (idempotent).
+fn add_thread_to_user_account(
+    payer: &AccountInfo,
+    user_pda: &AccountInfo,
+    user_pubkey: &Pubkey,
+    bump: u8,
+    thread_id: [u8; 32],
+    state: u8,
+) -> ProgramResult {
+    // Deserialize current account data
+    let data = user_pda.try_borrow_data()?;
+    let mut user_account =
+        UserAccount::deserialize(&mut &data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
+    drop(data);
+
+    // Skip if thread already exists (idempotent)
+    if user_account
+        .threads
+        .iter()
+        .any(|t| t.thread_id == thread_id)
+    {
+        return Ok(());
+    }
+
+    // Add new thread entry
+    user_account.threads.push(ThreadEntry { state, thread_id });
+
+    // Check if resize is needed
+    let required_size = UserAccount::size_for_threads(user_account.threads.len());
+    let current_size = user_pda.data_len();
+
+    if required_size > current_size {
+        // Need to reallocate - add capacity for more threads
+        let new_size =
+            UserAccount::size_for_threads(user_account.threads.len() + INITIAL_THREAD_CAPACITY);
+        let rent = pinocchio::sysvars::rent::Rent::get()?;
+        let new_rent = rent.minimum_balance(new_size);
+        let current_lamports = user_pda.lamports();
+
+        if new_rent > current_lamports {
+            // Transfer additional lamports from payer
+            let diff = new_rent - current_lamports;
+            Transfer {
+                from: payer,
+                to: user_pda,
+                lamports: diff,
+            }
+            .invoke()?;
+        }
+
+        // Resize the account using invoke_signed with PDA seeds
+        let bump_slice = [bump];
+        let signer_seeds = seeds!(USER_SEED, user_pubkey.as_ref(), &bump_slice);
+        user_pda.resize(new_size)?;
+        // Note: resize doesn't need invoke_signed, the program owns the account
+        let _ = signer_seeds; // silence unused warning
+    }
+
+    // Serialize and write updated data
+    let mut data = user_pda.try_borrow_mut_data()?;
+    user_account
+        .serialize(&mut &mut data[..])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+
+    Ok(())
 }
 
 // ============================================================================
@@ -328,19 +405,44 @@ pub fn process_instruction(
 // ============================================================================
 
 /// Creates a new encrypted DM message as a ZK-compressed account leaf.
+/// Also adds the thread to both sender's and recipient's UserAccount PDAs.
 pub fn send_dm_message(
     accounts: &[AccountInfo],
     instruction_data: SendDmMessageData,
 ) -> ProgramResult {
     let signer = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let sender_user_pda = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let recipient_user_pda = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
+    let _system_program = accounts.get(3).ok_or(ProgramError::NotEnoughAccountKeys)?;
 
-    // Get current slot for message ordering
+    let program_id = Pubkey::from(ID);
+
+    // Verify sender's PDA
+    let (expected_sender_pda, sender_bump) = get_user_pda(signer.key(), &program_id);
+    if sender_user_pda.key() != &expected_sender_pda {
+        return Err(SolcryptError::InvalidPda.into());
+    }
+    if sender_user_pda.data_is_empty() {
+        return Err(SolcryptError::UserNotInitialized.into());
+    }
+
+    // Verify recipient's PDA
+    let recipient_pubkey: Pubkey = instruction_data.recipient;
+    let (expected_recipient_pda, recipient_bump) = get_user_pda(&recipient_pubkey, &program_id);
+    if recipient_user_pda.key() != &expected_recipient_pda {
+        return Err(SolcryptError::InvalidPda.into());
+    }
+    if recipient_user_pda.data_is_empty() {
+        return Err(SolcryptError::RecipientNotInitialized.into());
+    }
+
+    // Get current timestamp for message ordering
     let clock = Clock::get()?;
     let unix_timestamp = clock.unix_timestamp;
 
-    // Setup CPI accounts for Light Protocol
+    // Setup CPI accounts for Light Protocol (accounts after system_program)
     let config = CpiAccountsConfig::new(LIGHT_CPI_SIGNER);
-    let cpi_accounts = CpiAccounts::try_new_with_config(signer, &accounts[1..], config)
+    let cpi_accounts = CpiAccounts::try_new_with_config(signer, &accounts[4..], config)
         .map_err(to_custom_error_u32)?;
 
     // Get the address tree pubkey for address derivation
@@ -354,7 +456,6 @@ pub fn send_dm_message(
         .key();
 
     // Derive unique address for this message using thread_id + nonce
-    let program_id = Pubkey::from(ID);
     let (address, address_seed) = derive_address(
         &[b"msg", &instruction_data.thread_id, &instruction_data.nonce],
         &tree_pubkey,
@@ -378,14 +479,36 @@ pub fn send_dm_message(
     msg.recipient = instruction_data.recipient;
     msg.unix_timestamp = unix_timestamp;
     msg.iv = instruction_data.iv;
-    msg.ciphertext = instruction_data.ciphertext;
+    msg.ciphertext = instruction_data.ciphertext.clone();
 
     // Execute CPI to create the compressed account
     LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, instruction_data.proof)
         .with_light_account(msg)
         .map_err(to_custom_error)?
         .with_new_addresses(&[new_address_params])
-        .invoke(cpi_accounts)
+        .invoke(cpi_accounts)?;
+
+    // Add thread to sender's UserAccount (state = ACCEPTED)
+    add_thread_to_user_account(
+        signer,
+        sender_user_pda,
+        signer.key(),
+        sender_bump,
+        instruction_data.thread_id,
+        THREAD_STATE_ACCEPTED,
+    )?;
+
+    // Add thread to recipient's UserAccount (state = PENDING)
+    add_thread_to_user_account(
+        signer,
+        recipient_user_pda,
+        &recipient_pubkey,
+        recipient_bump,
+        instruction_data.thread_id,
+        THREAD_STATE_PENDING,
+    )?;
+
+    Ok(())
 }
 
 /// Initializes a new UserAccount PDA with X25519 public key.
