@@ -136,6 +136,7 @@ fn get_user_pda(user: &Pubkey, program_id: &Pubkey) -> (Pubkey, u8) {
 pub enum Message {
     /// Plain text message (UTF-8)
     Text(String) = 0,
+    Image(String) = 10,
     // Future variants:
     // CompressedText { algo: u8, data: Vec<u8> },
     // File { name: String, mime: String, data: Vec<u8> },
@@ -408,7 +409,10 @@ pub async fn init_user(
     let program_id: Pubkey = solcrypt_program::ID.into();
     let (user_pda, _bump) = get_user_pda(&user.pubkey(), &program_id);
 
-    let instruction_data = InitUserData { x25519_pubkey };
+    let instruction_data = InitUserData {
+        discriminator: InstructionType::InitUser as u8,
+        x25519_pubkey,
+    };
     let inputs = instruction_data.try_to_vec().unwrap();
 
     let accounts = vec![
@@ -420,7 +424,7 @@ pub async fn init_user(
     let instruction = Instruction {
         program_id,
         accounts,
-        data: [&[InstructionType::InitUser as u8][..], &inputs[..]].concat(),
+        data: inputs,
     };
 
     rpc.create_and_send_transaction(&[instruction], &user.pubkey(), &[user])
@@ -438,7 +442,10 @@ pub async fn accept_thread_for(
     let program_id: Pubkey = solcrypt_program::ID.into();
     let (user_pda, _bump) = get_user_pda(&user.pubkey(), &program_id);
 
-    let instruction_data = AcceptThreadData { thread_id };
+    let instruction_data = AcceptThreadData {
+        discriminator: InstructionType::AcceptThread as u8,
+        thread_id,
+    };
     let inputs = instruction_data.try_to_vec().unwrap();
 
     let accounts = vec![
@@ -449,7 +456,7 @@ pub async fn accept_thread_for(
     let instruction = Instruction {
         program_id,
         accounts,
-        data: [&[InstructionType::AcceptThread as u8][..], &inputs[..]].concat(),
+        data: inputs,
     };
 
     // User signs
@@ -516,8 +523,9 @@ pub async fn send_dm_message(
     accounts.extend(light_accounts[1..].iter().cloned());
 
     let instruction_data = SendDmMessageData {
-        proof: rpc_result.proof,
-        address_tree_info: packed_address_tree_info,
+        discriminator: InstructionType::SendDmMessage as u8,
+        proof: rpc_result.proof.into(),
+        address_tree_info: packed_address_tree_info.into(),
         output_state_tree_index: output_merkle_tree_index,
         thread_id,
         recipient: recipient.to_bytes().into(),
@@ -530,7 +538,7 @@ pub async fn send_dm_message(
     let instruction = Instruction {
         program_id,
         accounts,
-        data: [&[InstructionType::SendDmMessage as u8][..], &inputs[..]].concat(),
+        data: inputs,
     };
 
     rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer])
@@ -548,7 +556,11 @@ pub async fn add_thread(
     let program_id: Pubkey = solcrypt_program::ID.into();
     let (user_pda, _bump) = get_user_pda(&payer.pubkey(), &program_id);
 
-    let instruction_data = AddThreadData { thread_id, state };
+    let instruction_data = AddThreadData {
+        discriminator: InstructionType::AddThread as u8,
+        thread_id,
+        state,
+    };
     let inputs = instruction_data.try_to_vec().unwrap();
 
     let accounts = vec![
@@ -560,7 +572,7 @@ pub async fn add_thread(
     let instruction = Instruction {
         program_id,
         accounts,
-        data: [&[InstructionType::AddThread as u8][..], &inputs[..]].concat(),
+        data: inputs,
     };
 
     rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer])
@@ -577,7 +589,10 @@ pub async fn accept_thread(
     let program_id: Pubkey = solcrypt_program::ID.into();
     let (user_pda, _bump) = get_user_pda(&payer.pubkey(), &program_id);
 
-    let instruction_data = AcceptThreadData { thread_id };
+    let instruction_data = AcceptThreadData {
+        discriminator: InstructionType::AcceptThread as u8,
+        thread_id,
+    };
     let inputs = instruction_data.try_to_vec().unwrap();
 
     let accounts = vec![
@@ -588,7 +603,7 @@ pub async fn accept_thread(
     let instruction = Instruction {
         program_id,
         accounts,
-        data: [&[InstructionType::AcceptThread as u8][..], &inputs[..]].concat(),
+        data: inputs,
     };
 
     rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer])
@@ -605,7 +620,10 @@ pub async fn remove_thread(
     let program_id: Pubkey = solcrypt_program::ID.into();
     let (user_pda, _bump) = get_user_pda(&payer.pubkey(), &program_id);
 
-    let instruction_data = RemoveThreadData { thread_id };
+    let instruction_data = RemoveThreadData {
+        discriminator: InstructionType::RemoveThread as u8,
+        thread_id,
+    };
     let inputs = instruction_data.try_to_vec().unwrap();
 
     let accounts = vec![
@@ -616,7 +634,7 @@ pub async fn remove_thread(
     let instruction = Instruction {
         program_id,
         accounts,
-        data: [&[InstructionType::RemoveThread as u8][..], &inputs[..]].concat(),
+        data: inputs,
     };
 
     rpc.create_and_send_transaction(&[instruction], &payer.pubkey(), &[payer])

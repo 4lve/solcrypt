@@ -47,3 +47,7 @@ check-cfg = [
     'cfg(target_os, values("solana"))',
     'cfg(feature, values("frozen-abi", "no-entrypoint", "test-sbf"))',
 ]
+
+
+[package.metadata.solana]
+program-id = "GRLu2hKaAiMbxpkAM1HeXzks9YeGuz18SEgXEizVvPqX"
