@@ -13,6 +13,7 @@ no-idl = []
 no-log-ix-name = []
 cpi = ["no-entrypoint"]
 test-sbf = []
+bpf-entrypoint = []
 default = []
 
 [dependencies]
@@ -50,4 +51,4 @@ check-cfg = [
 
 
 [package.metadata.solana]
-program-id = "GRLu2hKaAiMbxpkAM1HeXzks9YeGuz18SEgXEizVvPqX"
+program-id = "AESxu6qe2Mo5Ue8KJo33Di5UT5dW5CmJQwxqHh8dNK6y"

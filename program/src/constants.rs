@@ -6,9 +6,9 @@ use pinocchio::pubkey::Pubkey;
 // Program Constants
 // ============================================================================
 
-pub const ID: Pubkey = pubkey_array!("GRLu2hKaAiMbxpkAM1HeXzks9YeGuz18SEgXEizVvPqX");
+pub const ID: Pubkey = pubkey_array!("AESxu6qe2Mo5Ue8KJo33Di5UT5dW5CmJQwxqHh8dNK6y");
 pub const LIGHT_CPI_SIGNER: CpiSigner =
-    derive_light_cpi_signer!("GRLu2hKaAiMbxpkAM1HeXzks9YeGuz18SEgXEizVvPqX");
+    derive_light_cpi_signer!("AESxu6qe2Mo5Ue8KJo33Di5UT5dW5CmJQwxqHh8dNK6y");
 
 /// Seed for UserAccount PDA derivation
 pub const USER_SEED: &[u8] = b"user";

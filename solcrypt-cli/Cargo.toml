@@ -1,0 +1,36 @@
+[package]
+name = "solcrypt-cli"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Local program crate
+solcrypt = { path = "../program" }
+
+# Light Protocol
+light-client = "0.17.2"
+light-sdk = { version = "0.17.1", features = ["keccak"] }
+
+# Solana
+solana-sdk = "2.3"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async
+tokio = { version = "1", features = ["full"] }
+
+# Serialization (match program's version for compatibility)
+borsh = "0.10.4"
+
+# Crypto
+aes-gcm = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+sha2 = "0.10"
+
+# Utils
+bs58 = "0.5"
+anyhow = "1"
+chrono = "0.4"
+hex = "0.4"
+dotenv = "0.15"

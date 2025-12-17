@@ -1,5 +1,5 @@
 [workspace]
-members = ["codama", "program"]
+members = ["codama", "program", "solcrypt-cli"]
 resolver = "2"
 
 [workspace.dependencies]
