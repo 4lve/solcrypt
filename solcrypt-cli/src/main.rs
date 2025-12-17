@@ -1,21 +1,33 @@
 //! Solcrypt CLI - End-to-End Encrypted Messaging on Solana
 //!
-//! A command-line interface for the Solcrypt E2EE messaging protocol.
+//! An interactive TUI for the Solcrypt E2EE messaging protocol.
 
+mod app;
 mod client;
 mod crypto;
+mod events;
 mod instructions;
+mod ui;
 
+use std::io;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use chrono::{TimeZone, Utc};
-use clap::{Parser, Subcommand};
+use clap::Parser;
+use crossterm::{
+    event::{DisableMouseCapture, EnableMouseCapture, Event},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::{backend::CrosstermBackend, Terminal};
 use solana_sdk::{pubkey::Pubkey, signature::read_keypair_file};
 use x25519_dalek::PublicKey as X25519PublicKey;
 
-use client::{format_pubkey, format_thread_id, SolcryptClient};
+use app::{App, Screen};
+use client::SolcryptClient;
 use crypto::{compute_thread_id, derive_aes_key, derive_x25519_keypair, Message};
+use events::{handle_key_event, poll_event, EventResult};
 use instructions::{
     create_accept_thread_transaction, create_init_user_transaction,
     create_send_dm_message_transaction,
@@ -30,42 +42,6 @@ struct Cli {
     /// Path to the Solana keypair JSON file
     #[arg(short, long)]
     keypair: PathBuf,
-
-    #[command(subcommand)]
-    command: Commands,
-}
-
-#[derive(Subcommand)]
-enum Commands {
-    /// Initialize your user account (auto-runs if needed for other commands)
-    Init,
-
-    /// List all your chats (accepted and pending)
-    Chats,
-
-    /// Load and display messages for a conversation
-    Messages {
-        /// The recipient's public key (base58)
-        recipient: String,
-    },
-
-    /// Send an encrypted message to a recipient
-    Send {
-        /// The recipient's public key (base58)
-        recipient: String,
-
-        /// The message content to send
-        message: String,
-    },
-
-    /// Accept a pending chat request
-    Accept {
-        /// The sender's public key (base58) whose chat request you want to accept
-        sender: String,
-    },
-
-    /// Show your public key and X25519 public key
-    Whoami,
 }
 
 #[tokio::main]
@@ -83,44 +59,161 @@ async fn main() -> Result<()> {
     // Create the client
     let mut client = SolcryptClient::new(keypair).await?;
 
-    match cli.command {
-        Commands::Init => {
-            handle_init(&mut client, x25519_public).await?;
+    // Ensure user is initialized
+    ensure_initialized(&mut client, x25519_public).await?;
+
+    // Setup terminal
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    // Create app
+    let mut app = App::new(client.pubkey());
+
+    // Run the app
+    let result = run_app(&mut terminal, &mut app, &mut client, &x25519_secret).await;
+
+    // Restore terminal
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    // Handle errors
+    if let Err(e) = result {
+        eprintln!("Error: {:?}", e);
+    }
+
+    Ok(())
+}
+
+/// Main application loop
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    client: &mut SolcryptClient,
+    x25519_secret: &x25519_dalek::StaticSecret,
+) -> Result<()> {
+    // Initial load of chats
+    load_chats(app, client).await?;
+    app.screen = Screen::ChatList;
+
+    loop {
+        // Draw UI
+        terminal.draw(|f| ui::render(f, app))?;
+
+        // Poll for events
+        if let Some(event) = poll_event(Duration::from_millis(100))? {
+            if let Event::Key(key) = event {
+                let result = handle_key_event(app, key);
+
+                match result {
+                    EventResult::Continue => {}
+                    EventResult::RefreshChats => {
+                        app.screen = Screen::Loading {
+                            message: "Refreshing...".to_string(),
+                        };
+                        terminal.draw(|f| ui::render(f, app))?;
+                        load_chats(app, client).await?;
+                        app.screen = Screen::ChatList;
+                    }
+                    EventResult::OpenChat => {
+                        if let Some(chat) = app.get_selected_chat() {
+                            if !chat.is_accepted {
+                                app.set_status("Accept this chat first with 'a'");
+                            } else {
+                                let recipient = chat.other_party;
+                                app.navigate_to(Screen::Chat { recipient });
+                                load_messages(app, client, x25519_secret, &recipient).await?;
+                            }
+                        }
+                    }
+                    EventResult::SendMessage(content) => {
+                        if let Screen::Chat { recipient } = &app.screen {
+                            let recipient = *recipient;
+                            send_message(app, client, x25519_secret, &recipient, &content).await?;
+                            // Reload messages
+                            load_messages(app, client, x25519_secret, &recipient).await?;
+                        }
+                    }
+                    EventResult::StartNewChat(recipient_str) => {
+                        match recipient_str.parse::<Pubkey>() {
+                            Ok(recipient) => {
+                                // Check if recipient is initialized
+                                match client.get_user_x25519_pubkey(&recipient).await {
+                                    Ok(Some(_)) => {
+                                        app.navigate_to(Screen::Chat { recipient });
+                                        load_messages(app, client, x25519_secret, &recipient)
+                                            .await?;
+                                    }
+                                    Ok(None) => {
+                                        app.navigate_to(Screen::Error {
+                                            message: "Recipient has not initialized their account"
+                                                .to_string(),
+                                        });
+                                    }
+                                    Err(e) => {
+                                        app.navigate_to(Screen::Error {
+                                            message: format!("Failed to check recipient: {}", e),
+                                        });
+                                    }
+                                }
+                            }
+                            Err(_) => {
+                                app.navigate_to(Screen::Error {
+                                    message: "Invalid public key format".to_string(),
+                                });
+                            }
+                        }
+                    }
+                    EventResult::AcceptChat => {
+                        if let Some(chat) = app.get_selected_chat() {
+                            if !chat.is_accepted {
+                                let thread_id = chat.thread_id;
+                                app.screen = Screen::Loading {
+                                    message: "Accepting chat...".to_string(),
+                                };
+                                terminal.draw(|f| ui::render(f, app))?;
+
+                                match accept_chat(client, thread_id).await {
+                                    Ok(_) => {
+                                        load_chats(app, client).await?;
+                                        app.screen = Screen::ChatList;
+                                        app.set_status("Chat accepted!");
+                                    }
+                                    Err(e) => {
+                                        app.screen = Screen::Error {
+                                            message: format!("Failed to accept: {}", e),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    EventResult::LoadMessages => {
+                        if let Screen::Chat { recipient } = &app.screen {
+                            let recipient = *recipient;
+                            load_messages(app, client, x25519_secret, &recipient).await?;
+                        }
+                    }
+                }
+            }
         }
-        Commands::Chats => {
-            ensure_initialized(&mut client, x25519_public).await?;
-            handle_chats(&mut client).await?;
-        }
-        Commands::Messages { recipient } => {
-            ensure_initialized(&mut client, x25519_public).await?;
-            let recipient_pubkey = parse_pubkey(&recipient)?;
-            handle_messages(&mut client, &x25519_secret, &recipient_pubkey).await?;
-        }
-        Commands::Send { recipient, message } => {
-            ensure_initialized(&mut client, x25519_public).await?;
-            let recipient_pubkey = parse_pubkey(&recipient)?;
-            handle_send(&mut client, &x25519_secret, &recipient_pubkey, &message).await?;
-        }
-        Commands::Accept { sender } => {
-            ensure_initialized(&mut client, x25519_public).await?;
-            let sender_pubkey = parse_pubkey(&sender)?;
-            handle_accept(&mut client, &sender_pubkey).await?;
-        }
-        Commands::Whoami => {
-            handle_whoami(&client, &x25519_public)?;
+
+        if app.should_quit {
+            break;
         }
     }
 
     Ok(())
 }
 
-/// Parse a base58 public key string
-fn parse_pubkey(s: &str) -> Result<Pubkey> {
-    s.parse::<Pubkey>()
-        .with_context(|| format!("Invalid public key: {}", s))
-}
-
-/// Ensure the user account is initialized, creating it if necessary
+/// Ensure the user account is initialized
 async fn ensure_initialized(
     client: &mut SolcryptClient,
     x25519_public: X25519PublicKey,
@@ -128,199 +221,124 @@ async fn ensure_initialized(
     let exists = client.user_account_exists(&client.pubkey()).await?;
 
     if !exists {
-        println!("User account not found. Initializing...");
+        eprintln!("Initializing user account...");
         let tx = create_init_user_transaction(client, x25519_public.to_bytes()).await?;
-        let sig = client.send_and_confirm_transaction(tx).await?;
-        println!("✓ User account initialized! Tx: {}", sig);
+        client.send_and_confirm_transaction(tx).await?;
+        eprintln!("User account initialized!");
     }
 
     Ok(())
 }
 
-/// Handle the `init` command
-async fn handle_init(client: &mut SolcryptClient, x25519_public: X25519PublicKey) -> Result<()> {
-    let exists = client.user_account_exists(&client.pubkey()).await?;
+/// Load chats into app state
+async fn load_chats(app: &mut App, client: &mut SolcryptClient) -> Result<()> {
+    use crate::app::ChatThread;
 
-    if exists {
-        println!("User account already initialized.");
-        return Ok(());
-    }
+    let (accepted_entries, pending_entries) = client.get_threads().await.unwrap_or_default();
+    let my_pubkey = client.pubkey();
 
-    println!("Initializing user account...");
-    let tx = create_init_user_transaction(client, x25519_public.to_bytes()).await?;
-    let sig = client.send_and_confirm_transaction(tx).await?;
-    println!("✓ User account initialized!");
-    println!("  Transaction: {}", sig);
-    println!("  Solana Pubkey: {}", client.pubkey());
-    println!(
-        "  X25519 Pubkey: {}",
-        bs58::encode(x25519_public.as_bytes()).into_string()
-    );
+    let mut accepted_chats = Vec::new();
+    let mut pending_chats = Vec::new();
 
-    Ok(())
-}
-
-/// Handle the `chats` command
-async fn handle_chats(client: &mut SolcryptClient) -> Result<()> {
-    let (accepted, pending) = client.get_threads().await?;
-
-    if accepted.is_empty() && pending.is_empty() {
-        println!("No chats found. Start a conversation with `send <recipient> <message>`");
-        return Ok(());
-    }
-
-    if !accepted.is_empty() {
-        println!("\n=== Accepted Chats ({}) ===", accepted.len());
-        for thread in &accepted {
-            println!("  Thread: {}", format_thread_id(&thread.thread_id));
+    // Resolve other_party for each accepted thread
+    for entry in accepted_entries {
+        if let Ok(Some(other_party)) = client
+            .get_other_party_for_thread(entry.thread_id, &my_pubkey)
+            .await
+        {
+            accepted_chats.push(ChatThread {
+                thread_id: entry.thread_id,
+                other_party,
+                is_accepted: true,
+                last_message: None,
+                unread: false,
+            });
         }
     }
 
-    if !pending.is_empty() {
-        println!("\n=== Pending Requests ({}) ===", pending.len());
-        println!("(Use `accept <sender>` to accept a chat request)");
-        for thread in &pending {
-            println!("  Thread: {}", format_thread_id(&thread.thread_id));
+    // Resolve other_party for each pending thread
+    for entry in pending_entries {
+        if let Ok(Some(other_party)) = client
+            .get_other_party_for_thread(entry.thread_id, &my_pubkey)
+            .await
+        {
+            pending_chats.push(ChatThread {
+                thread_id: entry.thread_id,
+                other_party,
+                is_accepted: false,
+                last_message: None,
+                unread: true,
+            });
         }
     }
 
-    println!();
+    app.update_chats(accepted_chats, pending_chats);
     Ok(())
 }
 
-/// Handle the `messages` command
-async fn handle_messages(
+/// Load messages for a chat
+async fn load_messages(
+    app: &mut App,
     client: &mut SolcryptClient,
     x25519_secret: &x25519_dalek::StaticSecret,
     recipient: &Pubkey,
 ) -> Result<()> {
-    // Get recipient's X25519 public key for decryption
+    // Get recipient's X25519 pubkey
     let recipient_x25519_bytes = client
         .get_user_x25519_pubkey(recipient)
         .await?
-        .context("Recipient has not initialized their account")?;
+        .context("Recipient not initialized")?;
     let recipient_x25519 = X25519PublicKey::from(recipient_x25519_bytes);
 
-    // Derive the shared AES key
+    // Derive AES key
     let aes_key = derive_aes_key(x25519_secret, &recipient_x25519);
 
     // Compute thread ID
     let thread_id = compute_thread_id(&client.pubkey(), recipient);
-
-    println!("Loading messages with {}...", format_pubkey(recipient));
-    println!("Thread ID: {}", format_thread_id(&thread_id));
-    println!();
 
     // Fetch messages
     let messages = client.get_messages_for_thread(thread_id).await?;
 
-    if messages.is_empty() {
-        println!("No messages in this conversation yet.");
-        return Ok(());
-    }
-
-    println!("=== Messages ({}) ===\n", messages.len());
-
-    for msg in messages {
-        // Determine if this is from us or them
-        let sender_pubkey = Pubkey::from(msg.sender);
-        let is_me = sender_pubkey == client.pubkey();
-        let sender_label = if is_me {
-            "You"
-        } else {
-            &format_pubkey(&sender_pubkey)
-        };
-
-        // Format timestamp
-        let timestamp = Utc
-            .timestamp_opt(msg.unix_timestamp, 0)
-            .single()
-            .map(|t| t.format("%Y-%m-%d %H:%M:%S UTC").to_string())
-            .unwrap_or_else(|| "Unknown time".to_string());
-
-        // Decrypt message content
-        match Message::decrypt(&aes_key, &msg.iv, &msg.ciphertext) {
-            Ok(decrypted) => {
-                println!(
-                    "[{}] {}: {}",
-                    timestamp,
-                    sender_label,
-                    decrypted.display_text()
-                );
-            }
-            Err(_) => {
-                println!("[{}] {}: <decryption failed>", timestamp, sender_label);
-            }
-        }
-    }
-
-    println!();
+    app.update_messages(messages, &aes_key);
     Ok(())
 }
 
-/// Handle the `send` command
-async fn handle_send(
+/// Send a message
+async fn send_message(
+    _app: &mut App,
     client: &mut SolcryptClient,
     x25519_secret: &x25519_dalek::StaticSecret,
     recipient: &Pubkey,
-    message_text: &str,
+    content: &str,
 ) -> Result<()> {
-    // Check recipient is initialized
+    // Get recipient's X25519 pubkey
     let recipient_x25519_bytes = client
         .get_user_x25519_pubkey(recipient)
         .await?
-        .context("Recipient has not initialized their account. They need to run `init` first.")?;
+        .context("Recipient not initialized")?;
     let recipient_x25519 = X25519PublicKey::from(recipient_x25519_bytes);
 
-    // Derive the shared AES key
+    // Derive AES key
     let aes_key = derive_aes_key(x25519_secret, &recipient_x25519);
 
     // Compute thread ID
     let thread_id = compute_thread_id(&client.pubkey(), recipient);
 
-    // Create and encrypt the message
-    let message = Message::text(message_text);
+    // Encrypt message
+    let message = Message::text(content);
     let (iv, ciphertext) = message.encrypt(&aes_key)?;
 
-    println!("Sending message to {}...", format_pubkey(recipient));
-
-    // Build and send transaction
+    // Send transaction
     let tx =
         create_send_dm_message_transaction(client, recipient, thread_id, iv, ciphertext).await?;
-    println!("Transaction");
-    let sig = client.send_and_confirm_transaction(tx).await?;
-
-    println!("✓ Message sent!");
-    println!("  Transaction: {}", sig);
+    client.send_and_confirm_transaction(tx).await?;
 
     Ok(())
 }
 
-/// Handle the `accept` command
-async fn handle_accept(client: &mut SolcryptClient, sender: &Pubkey) -> Result<()> {
-    // Compute thread ID
-    let thread_id = compute_thread_id(&client.pubkey(), sender);
-
-    println!("Accepting chat request from {}...", format_pubkey(sender));
-
+/// Accept a pending chat
+async fn accept_chat(client: &mut SolcryptClient, thread_id: [u8; 32]) -> Result<()> {
     let tx = create_accept_thread_transaction(client, thread_id).await?;
-    let sig = client.send_and_confirm_transaction(tx).await?;
-
-    println!("✓ Chat request accepted!");
-    println!("  Transaction: {}", sig);
-
-    Ok(())
-}
-
-/// Handle the `whoami` command
-fn handle_whoami(client: &SolcryptClient, x25519_public: &X25519PublicKey) -> Result<()> {
-    println!("=== Your Identity ===");
-    println!("Solana Pubkey: {}", client.pubkey());
-    println!(
-        "X25519 Pubkey: {}",
-        bs58::encode(x25519_public.as_bytes()).into_string()
-    );
-    println!("\nShare your Solana Pubkey with others so they can message you.");
-
+    client.send_and_confirm_transaction(tx).await?;
     Ok(())
 }

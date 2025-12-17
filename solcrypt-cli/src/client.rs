@@ -11,6 +11,7 @@ use light_client::{
     indexer::{AddressWithTree, Indexer, ValidityProofWithContext},
     rpc::{LightClient, LightClientConfig, Rpc},
 };
+use serde::{Deserialize, Serialize};
 use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signature},
@@ -19,21 +20,94 @@ use solana_sdk::{
 };
 use solcrypt_program::{MsgV1, ThreadEntry, UserAccount, THREAD_STATE_ACCEPTED, USER_SEED};
 
-/// Default RPC URL for Helius devnet
-//pub const RPC_URL: &str = "https://xenia-573pc0-fast-devnet.helius-rpc.com";
+// ============================================================================
+// Custom Photon API types (with correct base58 encoding for memcmp)
+// ============================================================================
+
+#[derive(Debug, Serialize)]
+struct PhotonRequest<T> {
+    jsonrpc: &'static str,
+    id: &'static str,
+    method: &'static str,
+    params: T,
+}
+
+#[derive(Debug, Serialize)]
+struct GetCompressedAccountsByOwnerParams {
+    owner: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filters: Option<Vec<PhotonFilterSelector>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    limit: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PhotonFilterSelector {
+    memcmp: PhotonMemcmp,
+}
+
+#[derive(Debug, Serialize)]
+struct PhotonMemcmp {
+    offset: u32,
+    bytes: String, // Base58 encoded!
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotonResponse<T> {
+    result: Option<T>,
+    error: Option<PhotonError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotonError {
+    code: i32,
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotonAccountsResult {
+    value: PhotonAccountList,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotonAccountList {
+    items: Vec<PhotonAccount>,
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotonAccount {
+    hash: String,
+    owner: String,
+    data: Option<PhotonAccountData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PhotonAccountData {
+    data: String, // Base64 encoded
+    discriminator: u64,
+}
 
 /// Client for interacting with the Solcrypt program
 pub struct SolcryptClient {
     pub rpc: LightClient,
     pub payer: Keypair,
+    http_client: reqwest::Client,
+    rpc_url: String,
 }
 
 impl SolcryptClient {
     /// Create a new client with the given keypair
     pub async fn new(payer: Keypair) -> Result<Self> {
+        let api_key = std::env::var("HELIUS_API_KEY")
+            .context("HELIUS_API_KEY environment variable not set")?;
+        let rpc_url = format!("https://devnet.helius-rpc.com?api-key={}", api_key);
+
         let config = LightClientConfig::devnet(
             Some("https://devnet.helius-rpc.com".to_string()),
-            Some(std::env::var("HELIUS_API_KEY").unwrap()),
+            Some(api_key),
         );
         let mut rpc = LightClient::new(config)
             .await
@@ -42,7 +116,14 @@ impl SolcryptClient {
         // Set the payer keypair
         rpc.payer = payer.insecure_clone();
 
-        Ok(Self { rpc, payer })
+        let http_client = reqwest::Client::new();
+
+        Ok(Self {
+            rpc,
+            payer,
+            http_client,
+            rpc_url,
+        })
     }
 
     /// Get the user's public key
@@ -134,33 +215,119 @@ impl SolcryptClient {
         Ok(result.value)
     }
 
-    /// Fetch compressed messages for a thread
-    /// Returns messages sorted by timestamp (oldest first)
-    pub async fn get_messages_for_thread(&self, thread_id: [u8; 32]) -> Result<Vec<MsgV1>> {
-        // Get all compressed accounts owned by our program
+    /// Custom getCompressedAccountsByOwner with proper base58 memcmp encoding
+    /// (light-client uses base64 which is wrong per Photon API spec)
+    async fn get_compressed_accounts_by_owner_custom(
+        &self,
+        owner: &Pubkey,
+        thread_id_filter: Option<[u8; 32]>,
+        limit: Option<u16>,
+    ) -> Result<Vec<MsgV1>> {
+        let filters = thread_id_filter.map(|tid| {
+            vec![PhotonFilterSelector {
+                memcmp: PhotonMemcmp {
+                    offset: 0, // thread_id is the first field
+                    bytes: bs58::encode(&tid).into_string(),
+                },
+            }]
+        });
+
+        let params = GetCompressedAccountsByOwnerParams {
+            owner: owner.to_string(),
+            filters,
+            limit,
+            cursor: None,
+        };
+
+        let request = PhotonRequest {
+            jsonrpc: "2.0",
+            id: "1",
+            method: "getCompressedAccountsByOwner",
+            params,
+        };
+
         let response = self
-            .rpc
-            .get_compressed_accounts_by_owner(&solcrypt_program::ID.into(), None, None)
+            .http_client
+            .post(&self.rpc_url)
+            .json(&request)
+            .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch compressed accounts: {:?}", e))?;
+            .context("Failed to send request to Photon API")?;
+
+        let result: PhotonResponse<PhotonAccountsResult> = response
+            .json()
+            .await
+            .context("Failed to parse Photon API response")?;
+
+        if let Some(error) = result.error {
+            anyhow::bail!("Photon API error {}: {}", error.code, error.message);
+        }
+
+        let accounts = result.result.context("No result in Photon API response")?;
 
         let mut messages: Vec<MsgV1> = Vec::new();
 
-        for account in response.value.items {
-            if let Some(data) = &account.data {
-                // Try to deserialize as MsgV1
-                if let Ok(msg) = MsgV1::deserialize(&mut data.data.as_slice()) {
-                    if msg.thread_id == thread_id {
-                        messages.push(msg);
-                    }
+        for account in accounts.value.items {
+            if let Some(data) = account.data {
+                // Decode base64 data
+                let bytes =
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data.data)
+                        .context("Failed to decode base64 account data")?;
+
+                if let Ok(msg) = MsgV1::deserialize(&mut bytes.as_slice()) {
+                    messages.push(msg);
                 }
             }
         }
+
+        Ok(messages)
+    }
+
+    /// Fetch compressed messages for a thread
+    /// Returns messages sorted by timestamp (oldest first)
+    pub async fn get_messages_for_thread(&self, thread_id: [u8; 32]) -> Result<Vec<MsgV1>> {
+        let mut messages = self
+            .get_compressed_accounts_by_owner_custom(
+                &solcrypt_program::ID.into(),
+                Some(thread_id),
+                None, // Get all messages for the thread
+            )
+            .await?;
 
         // Sort by timestamp (oldest first)
         messages.sort_by_key(|m| m.unix_timestamp);
 
         Ok(messages)
+    }
+
+    /// Get the other party's pubkey for a thread by looking at a message
+    /// Returns None if no messages exist in the thread
+    pub async fn get_other_party_for_thread(
+        &self,
+        thread_id: [u8; 32],
+        my_pubkey: &Pubkey,
+    ) -> Result<Option<Pubkey>> {
+        let messages = self
+            .get_compressed_accounts_by_owner_custom(
+                &solcrypt_program::ID.into(),
+                Some(thread_id),
+                Some(1), // We only need 1 message to determine the other party
+            )
+            .await?;
+
+        if let Some(msg) = messages.first() {
+            let sender = Pubkey::from(msg.sender);
+            let recipient = Pubkey::from(msg.recipient);
+
+            // Return the other party (not me)
+            if sender == *my_pubkey {
+                return Ok(Some(recipient));
+            } else {
+                return Ok(Some(sender));
+            }
+        }
+
+        Ok(None)
     }
 
     /// Send a transaction and wait for confirmation
