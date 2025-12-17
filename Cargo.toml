@@ -1,0 +1,6 @@
+[workspace]
+members = ["codama", "program"]
+resolver = "2"
+
+[workspace.dependencies]
+codama = "0.7.1"
