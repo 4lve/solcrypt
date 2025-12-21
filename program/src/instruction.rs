@@ -71,7 +71,8 @@ pub struct SendDmMessageData {
     pub iv: [u8; 12],
     /// Encrypted message content
     pub ciphertext: Vec<u8>,
-    /// Random nonce for unique address derivation
+    /// Nonce for unique address derivation
+    /// MUST be all zeros for the first message in a thread, non-zero for subsequent messages
     pub nonce: [u8; 32],
 }
 

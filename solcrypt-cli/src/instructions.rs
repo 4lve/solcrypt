@@ -161,8 +161,22 @@ pub async fn build_send_dm_message_instruction(
     let address_tree_pubkey = address_tree_info.tree;
     let merkle_tree_pubkey = state_tree_info.tree;
 
-    // Generate random nonce for unique address
-    let nonce = random_nonce();
+    // Check if this is the first message in the thread
+    // (thread doesn't exist in sender's account yet)
+    let sender_account = client.get_user_account(&signer).await?;
+    let is_first_message = match sender_account {
+        Some(account) => !account.threads.iter().any(|t| t.thread_id == thread_id),
+        None => {
+            anyhow::bail!("Sender user account not initialized");
+        }
+    };
+
+    // Use nonce=0 for first message, random nonce for subsequent messages
+    let nonce = if is_first_message {
+        [0u8; 32]
+    } else {
+        random_nonce()
+    };
 
     // Derive the message address
     let (msg_address, _) = derive_address(

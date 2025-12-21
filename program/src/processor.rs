@@ -122,6 +122,12 @@ fn add_thread_to_user_account(
 
 /// Creates a new encrypted DM message as a ZK-compressed account leaf.
 /// Also adds the thread to both sender's and recipient's UserAccount PDAs.
+///
+/// ## Nonce Validation
+/// The first message in a thread MUST use nonce=0 (all zeros). This enables
+/// O(1) client-side lookup of the first message by deriving its address
+/// deterministically. Subsequent messages must use non-zero nonces to avoid
+/// address collisions.
 pub fn send_dm_message(
     accounts: &[AccountInfo],
     instruction_data: SendDmMessageData,
@@ -155,6 +161,25 @@ pub fn send_dm_message(
     // Get current timestamp for message ordering
     let clock = Clock::get()?;
     let unix_timestamp = clock.unix_timestamp;
+
+    // Check if this is the first message in the thread (thread doesn't exist in sender's account)
+    let sender_data = sender_user_pda.try_borrow_data()?;
+    let sender_account = UserAccount::deserialize(&mut &sender_data[..])
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let is_first_message = !sender_account
+        .threads
+        .iter()
+        .any(|t| t.thread_id == instruction_data.thread_id);
+    drop(sender_data);
+
+    // Validate nonce based on whether this is the first message
+    let nonce_is_zero = instruction_data.nonce.iter().all(|&b| b == 0);
+    if is_first_message && !nonce_is_zero {
+        return Err(SolcryptError::FirstMessageMustUseNonceZero.into());
+    }
+    if !is_first_message && nonce_is_zero {
+        return Err(SolcryptError::SubsequentMessageCannotUseNonceZero.into());
+    }
 
     // Setup CPI accounts for Light Protocol (accounts after system_program)
     let config = CpiAccountsConfig::new(LIGHT_CPI_SIGNER);

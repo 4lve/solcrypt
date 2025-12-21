@@ -11,6 +11,7 @@ use light_client::{
     indexer::{AddressWithTree, Indexer, ValidityProofWithContext},
     rpc::{LightClient, LightClientConfig, Rpc},
 };
+use light_sdk::address::v1::derive_address;
 use serde::{Deserialize, Serialize};
 use solana_sdk::{
     pubkey::Pubkey,
@@ -300,34 +301,104 @@ impl SolcryptClient {
         Ok(messages)
     }
 
-    /// Get the other party's pubkey for a thread by looking at a message
-    /// Returns None if no messages exist in the thread
+    /// Get the other party's pubkey for a thread by fetching the first message (nonce=0).
+    ///
+    /// This uses O(1) lookup since the first message always has nonce=0, allowing us to
+    /// derive its address deterministically without querying all messages.
+    ///
+    /// Returns None if the first message doesn't exist.
     pub async fn get_other_party_for_thread(
         &self,
         thread_id: [u8; 32],
         my_pubkey: &Pubkey,
     ) -> Result<Option<Pubkey>> {
-        let messages = self
-            .get_compressed_accounts_by_owner_custom(
-                &solcrypt_program::ID.into(),
-                Some(thread_id),
-                Some(1), // We only need 1 message to determine the other party
-            )
-            .await?;
+        // Get the address tree to derive the first message's address
+        let address_tree_info = self.rpc.get_address_tree_v1();
+        let address_tree_pubkey = address_tree_info.tree;
 
-        if let Some(msg) = messages.first() {
-            let sender = Pubkey::from(msg.sender);
-            let recipient = Pubkey::from(msg.recipient);
+        // The first message always uses nonce=0
+        let nonce = [0u8; 32];
 
-            // Return the other party (not me)
-            if sender == *my_pubkey {
-                return Ok(Some(recipient));
-            } else {
-                return Ok(Some(sender));
+        // Derive the first message's address deterministically
+        let (first_msg_address, _) = derive_address(
+            &[b"msg", &thread_id, &nonce],
+            &address_tree_pubkey,
+            &solcrypt_program::ID.into(),
+        );
+
+        // Try to fetch the first message directly by its derived address
+        match self
+            .get_compressed_account_by_address(&first_msg_address)
+            .await?
+        {
+            Some(msg) => {
+                let sender = Pubkey::from(msg.sender);
+                let recipient = Pubkey::from(msg.recipient);
+
+                // Return the other party (not me)
+                if sender == *my_pubkey {
+                    Ok(Some(recipient))
+                } else {
+                    Ok(Some(sender))
+                }
             }
+            None => Ok(None),
+        }
+    }
+
+    /// Get a compressed account by its specific address (O(1) lookup)
+    async fn get_compressed_account_by_address(&self, address: &[u8; 32]) -> Result<Option<MsgV1>> {
+        // Photon API: getCompressedAccount
+        #[derive(Debug, Serialize)]
+        struct GetCompressedAccountParams {
+            address: String, // Base58 encoded address
         }
 
-        Ok(None)
+        let params = GetCompressedAccountParams {
+            address: bs58::encode(address).into_string(),
+        };
+
+        let request = PhotonRequest {
+            jsonrpc: "2.0",
+            id: "1",
+            method: "getCompressedAccount",
+            params,
+        };
+
+        let response = self
+            .http_client
+            .post(&self.rpc_url)
+            .json(&request)
+            .send()
+            .await
+            .context("Failed to send request to Photon API")?;
+
+        let result: PhotonResponse<Option<PhotonAccount>> = response
+            .json()
+            .await
+            .context("Failed to parse Photon API response")?;
+
+        if let Some(error) = result.error {
+            anyhow::bail!("Photon API error {}: {}", error.code, error.message);
+        }
+
+        match result.result {
+            Some(Some(account)) => {
+                if let Some(data) = account.data {
+                    let bytes = base64::Engine::decode(
+                        &base64::engine::general_purpose::STANDARD,
+                        &data.data,
+                    )
+                    .context("Failed to decode base64 account data")?;
+
+                    if let Ok(msg) = MsgV1::deserialize(&mut bytes.as_slice()) {
+                        return Ok(Some(msg));
+                    }
+                }
+                Ok(None)
+            }
+            _ => Ok(None),
+        }
     }
 
     /// Send a transaction and wait for confirmation

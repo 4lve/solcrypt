@@ -25,6 +25,10 @@ pub enum SolcryptError {
     UserNotInitialized,
     #[codama(error("Recipient has not initialized their user account"))]
     RecipientNotInitialized,
+    #[codama(error("First message in a thread must use nonce 0"))]
+    FirstMessageMustUseNonceZero,
+    #[codama(error("Subsequent messages must not use nonce 0"))]
+    SubsequentMessageCannotUseNonceZero,
 }
 
 impl From<SolcryptError> for ProgramError {
@@ -39,6 +43,8 @@ impl From<SolcryptError> for ProgramError {
             SolcryptError::UserAlreadyInitialized => ProgramError::Custom(7),
             SolcryptError::UserNotInitialized => ProgramError::Custom(8),
             SolcryptError::RecipientNotInitialized => ProgramError::Custom(9),
+            SolcryptError::FirstMessageMustUseNonceZero => ProgramError::Custom(10),
+            SolcryptError::SubsequentMessageCannotUseNonceZero => ProgramError::Custom(11),
         }
     }
 }
