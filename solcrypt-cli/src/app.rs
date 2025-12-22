@@ -1,26 +1,39 @@
 //! Application state and screen management for the TUI.
 
 use solana_sdk::pubkey::Pubkey;
-use solcrypt_program::{ClientSideMessage, MsgV1};
+use solcrypt_program::{ClientSideMessage, GroupMsgV1, MsgV1};
 
 use crate::crypto::ClientSideMessageExt;
+
+/// The type of thread (DM or Group)
+#[derive(Debug, Clone, PartialEq)]
+pub enum ThreadType {
+    Dm,
+    Group,
+}
 
 /// The current screen/view in the application
 #[derive(Debug, Clone, PartialEq)]
 pub enum Screen {
     /// Chat list showing accepted and pending conversations
     ChatList,
-    /// Active chat conversation view
+    /// Active DM chat conversation view
     Chat { recipient: Pubkey },
+    /// Active group chat view
+    GroupChat { group_id: [u8; 32] },
     /// New chat dialog to enter recipient pubkey
     NewChat,
+    /// New group dialog
+    NewGroup,
+    /// Invite member to group dialog
+    InviteMember { group_id: [u8; 32] },
     /// Loading screen while performing async operations
     Loading { message: String },
     /// Error screen
     Error { message: String },
 }
 
-/// A chat thread with metadata for display
+/// A DM chat thread with metadata for display
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct ChatThread {
@@ -30,6 +43,20 @@ pub struct ChatThread {
     pub is_accepted: bool,
     pub last_message: Option<String>,
     pub unread: bool,
+}
+
+/// A group chat thread with metadata for display
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct GroupThread {
+    pub group_id: [u8; 32],
+    /// Group name (for now, abbreviated group_id)
+    pub name: String,
+    pub is_accepted: bool,
+    pub last_message: Option<String>,
+    pub unread: bool,
+    /// Number of members (if known)
+    pub member_count: Option<usize>,
 }
 
 /// A message for display
@@ -50,6 +77,13 @@ pub enum InputMode {
     Editing,
 }
 
+/// Which tab is selected in the chat list
+#[derive(Debug, Clone, PartialEq)]
+pub enum ListTab {
+    Chats,
+    Groups,
+}
+
 /// Main application state
 pub struct App {
     /// Current screen
@@ -65,17 +99,34 @@ pub struct App {
     /// Cursor position in input
     pub cursor_position: usize,
 
-    /// Accepted chat threads
+    /// Current tab in chat list
+    pub list_tab: ListTab,
+
+    /// Accepted DM chat threads
     pub accepted_chats: Vec<ChatThread>,
-    /// Pending chat threads
+    /// Pending DM chat threads
     pub pending_chats: Vec<ChatThread>,
     /// Currently selected chat index (in combined list)
     pub selected_chat: usize,
 
-    /// Messages in current chat
+    /// Accepted group threads
+    pub accepted_groups: Vec<GroupThread>,
+    /// Pending group invites
+    pub pending_groups: Vec<GroupThread>,
+    /// Currently selected group index (in combined list)
+    pub selected_group: usize,
+
+    /// Messages in current chat (DM)
     pub messages: Vec<DisplayMessage>,
+    /// Messages in current group chat
+    pub group_messages: Vec<DisplayMessage>,
     /// Scroll position in messages
     pub message_scroll: usize,
+
+    /// Current group ID (when in group chat)
+    pub current_group_id: Option<[u8; 32]>,
+    /// Current group AES key (when in group chat)
+    pub current_group_aes_key: Option<[u8; 32]>,
 
     /// Status message to show at bottom
     pub status: Option<String>,
@@ -101,11 +152,18 @@ impl App {
             input_mode: InputMode::Normal,
             input: String::new(),
             cursor_position: 0,
+            list_tab: ListTab::Chats,
             accepted_chats: Vec::new(),
             pending_chats: Vec::new(),
             selected_chat: 0,
+            accepted_groups: Vec::new(),
+            pending_groups: Vec::new(),
+            selected_group: 0,
             messages: Vec::new(),
+            group_messages: Vec::new(),
             message_scroll: 0,
+            current_group_id: None,
+            current_group_aes_key: None,
             status: None,
             user_pubkey,
             sending_message: false,
@@ -215,10 +273,53 @@ impl App {
         self.status = None;
     }
 
-    /// Update chats with resolved threads
+    /// Update DM chats with resolved threads
     pub fn update_chats(&mut self, accepted: Vec<ChatThread>, pending: Vec<ChatThread>) {
         self.accepted_chats = accepted;
         self.pending_chats = pending;
+    }
+
+    /// Update groups with resolved threads
+    pub fn update_groups(&mut self, accepted: Vec<GroupThread>, pending: Vec<GroupThread>) {
+        self.accepted_groups = accepted;
+        self.pending_groups = pending;
+    }
+
+    /// Get total number of groups
+    pub fn total_groups(&self) -> usize {
+        self.accepted_groups.len() + self.pending_groups.len()
+    }
+
+    /// Get currently selected group
+    pub fn get_selected_group(&self) -> Option<&GroupThread> {
+        if self.selected_group < self.accepted_groups.len() {
+            self.accepted_groups.get(self.selected_group)
+        } else {
+            self.pending_groups
+                .get(self.selected_group - self.accepted_groups.len())
+        }
+    }
+
+    /// Move group selection up
+    pub fn select_prev_group(&mut self) {
+        if self.selected_group > 0 {
+            self.selected_group -= 1;
+        }
+    }
+
+    /// Move group selection down
+    pub fn select_next_group(&mut self) {
+        if self.selected_group + 1 < self.total_groups() {
+            self.selected_group += 1;
+        }
+    }
+
+    /// Switch to the next tab
+    pub fn next_tab(&mut self) {
+        self.list_tab = match self.list_tab {
+            ListTab::Chats => ListTab::Groups,
+            ListTab::Groups => ListTab::Chats,
+        };
     }
 
     /// Update messages from MsgV1 list
@@ -251,5 +352,50 @@ impl App {
         if !self.messages.is_empty() {
             self.message_scroll = self.messages.len().saturating_sub(1);
         }
+    }
+
+    /// Update group messages from GroupMsgV1 list
+    pub fn update_group_messages(&mut self, msgs: Vec<GroupMsgV1>, aes_key: &[u8; 32]) {
+        self.group_messages = msgs
+            .into_iter()
+            .map(|msg| {
+                let sender = Pubkey::from(msg.sender);
+                let is_me = sender == self.user_pubkey;
+
+                let content = ClientSideMessage::decrypt(aes_key, &msg.iv, &msg.ciphertext)
+                    .map(|m| m.display_text().to_string())
+                    .unwrap_or_else(|_| "<decryption failed>".to_string());
+
+                let timestamp_str = chrono::DateTime::from_timestamp(msg.unix_timestamp, 0)
+                    .map(|dt| dt.format("%H:%M").to_string())
+                    .unwrap_or_else(|| "??:??".to_string());
+
+                DisplayMessage {
+                    sender,
+                    is_me,
+                    content,
+                    timestamp: msg.unix_timestamp,
+                    timestamp_str,
+                }
+            })
+            .collect();
+
+        // Scroll to bottom
+        if !self.group_messages.is_empty() {
+            self.message_scroll = self.group_messages.len().saturating_sub(1);
+        }
+    }
+
+    /// Set current group context
+    pub fn set_current_group(&mut self, group_id: [u8; 32], aes_key: [u8; 32]) {
+        self.current_group_id = Some(group_id);
+        self.current_group_aes_key = Some(aes_key);
+    }
+
+    /// Clear current group context
+    pub fn clear_current_group(&mut self) {
+        self.current_group_id = None;
+        self.current_group_aes_key = None;
+        self.group_messages.clear();
     }
 }

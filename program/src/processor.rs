@@ -223,6 +223,7 @@ pub fn send_dm_message(
     );
 
     // Populate message fields
+    msg.discriminator = crate::AccountDiscriminator::MsgV1;
     msg.thread_id = instruction_data.thread_id;
     msg.sender = *signer.key();
     msg.recipient = instruction_data.recipient;
@@ -583,6 +584,7 @@ pub fn create_group(
         Some(address),
         instruction_data.output_state_tree_index,
     );
+    group_key.discriminator = crate::AccountDiscriminator::GroupKeyV1;
     group_key.group_id = instruction_data.group_id;
     group_key.member = *signer.key();
     group_key.key_version = 1;
@@ -712,6 +714,7 @@ pub fn invite_to_group(
         Some(address),
         instruction_data.output_state_tree_index,
     );
+    group_key.discriminator = crate::AccountDiscriminator::GroupKeyV1;
     group_key.group_id = instruction_data.group_id;
     group_key.member = instruction_data.invitee;
     group_key.key_version = current_key_version;
@@ -1137,6 +1140,7 @@ pub fn rotate_group_key(
             Some(address),
             instruction_data.output_state_tree_index,
         );
+        group_key.discriminator = crate::AccountDiscriminator::GroupKeyV1;
         group_key.group_id = instruction_data.group_id;
         group_key.member = key_entry.member;
         group_key.key_version = new_key_version;
@@ -1244,6 +1248,7 @@ pub fn send_group_message(
         Some(address),
         instruction_data.output_state_tree_index,
     );
+    msg.discriminator = crate::AccountDiscriminator::GroupMsgV1;
     msg.group_id = instruction_data.group_id;
     msg.sender = *signer.key();
     msg.key_version = current_key_version;

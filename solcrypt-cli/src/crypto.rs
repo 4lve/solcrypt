@@ -115,6 +115,95 @@ pub fn random_nonce() -> [u8; 32] {
     nonce
 }
 
+/// Generate a random group ID
+pub fn random_group_id() -> [u8; 32] {
+    random_nonce()
+}
+
+/// Generate a random AES-256 key for group encryption
+pub fn generate_group_aes_key() -> [u8; 32] {
+    use aes_gcm::aead::rand_core::RngCore;
+    let mut key = [0u8; 32];
+    OsRng.fill_bytes(&mut key);
+    key
+}
+
+/// Encrypt a 32-byte AES key using AES-256-GCM key wrapping.
+/// Uses X25519 ECDH to derive a wrapping key, then AES-GCM to encrypt.
+///
+/// Layout of 48-byte output:
+/// - Bytes 0-47: AES-GCM ciphertext (32 bytes) + auth tag (16 bytes) = 48 bytes
+///
+/// The nonce is derived deterministically from the shared secret (no need to store it).
+pub fn encrypt_group_key_for_member(
+    group_aes_key: &[u8; 32],
+    our_secret: &X25519SecretKey,
+    their_public: &X25519PublicKey,
+) -> [u8; 48] {
+    // Derive shared secret via X25519 ECDH
+    let shared_secret = our_secret.diffie_hellman(their_public);
+
+    // Derive wrapping key (32 bytes for AES-256)
+    let mut key_hasher = Sha256::new();
+    key_hasher.update(shared_secret.as_bytes());
+    key_hasher.update(b"solcrypt-group-key-wrap-v1-key");
+    let wrapping_key: [u8; 32] = key_hasher.finalize().into();
+
+    // Derive nonce deterministically (12 bytes for AES-GCM)
+    // This is safe because we use a unique wrapping_key per recipient
+    let mut nonce_hasher = Sha256::new();
+    nonce_hasher.update(shared_secret.as_bytes());
+    nonce_hasher.update(b"solcrypt-group-key-wrap-v1-nonce");
+    let nonce_hash: [u8; 32] = nonce_hasher.finalize().into();
+    let nonce: [u8; 12] = nonce_hash[..12].try_into().unwrap();
+
+    // Encrypt using AES-256-GCM
+    let cipher = Aes256Gcm::new_from_slice(&wrapping_key).expect("Invalid key length");
+    let ciphertext = cipher
+        .encrypt(Nonce::from_slice(&nonce), group_aes_key.as_ref())
+        .expect("AES-GCM encryption failed");
+
+    // ciphertext = 32 bytes plaintext + 16 bytes auth tag = 48 bytes exactly
+    let mut result = [0u8; 48];
+    result.copy_from_slice(&ciphertext);
+    result
+}
+
+/// Decrypt a 48-byte encrypted group key using AES-256-GCM.
+pub fn decrypt_group_key(
+    encrypted_key: &[u8; 48],
+    our_secret: &X25519SecretKey,
+    their_public: &X25519PublicKey,
+) -> Result<[u8; 32]> {
+    // Derive shared secret via X25519 ECDH
+    let shared_secret = our_secret.diffie_hellman(their_public);
+
+    // Derive wrapping key (same as encryption)
+    let mut key_hasher = Sha256::new();
+    key_hasher.update(shared_secret.as_bytes());
+    key_hasher.update(b"solcrypt-group-key-wrap-v1-key");
+    let wrapping_key: [u8; 32] = key_hasher.finalize().into();
+
+    // Derive nonce deterministically (same as encryption)
+    let mut nonce_hasher = Sha256::new();
+    nonce_hasher.update(shared_secret.as_bytes());
+    nonce_hasher.update(b"solcrypt-group-key-wrap-v1-nonce");
+    let nonce_hash: [u8; 32] = nonce_hasher.finalize().into();
+    let nonce: [u8; 12] = nonce_hash[..12].try_into().unwrap();
+
+    // Decrypt using AES-256-GCM (authenticates and decrypts)
+    let cipher = Aes256Gcm::new_from_slice(&wrapping_key).context("Invalid key length")?;
+    let plaintext = cipher
+        .decrypt(Nonce::from_slice(&nonce), encrypted_key.as_ref())
+        .map_err(|_| {
+            anyhow::anyhow!("Group key decryption failed - invalid key or tampered data")
+        })?;
+
+    let mut aes_key = [0u8; 32];
+    aes_key.copy_from_slice(&plaintext);
+    Ok(aes_key)
+}
+
 pub trait ClientSideMessageExt {
     fn text(content: impl Into<String>) -> Self;
     fn encrypt(&self, aes_key: &[u8; 32]) -> Result<([u8; 12], Vec<u8>)>;

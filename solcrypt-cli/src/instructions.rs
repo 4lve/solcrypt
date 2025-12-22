@@ -22,8 +22,9 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use solcrypt_program::{
-    AcceptThreadData, AddThreadData, InitUserData, InstructionType, RemoveThreadData,
-    SendDmMessageData,
+    AcceptGroupInviteData, AcceptThreadData, AddThreadData, CreateGroupData, InitUserData,
+    InstructionType, InviteToGroupData, RemoveThreadData, SendDmMessageData, SendGroupMessageData,
+    GROUP_KEY_SEED,
 };
 use wincode::Serialize;
 
@@ -309,6 +310,479 @@ pub async fn create_accept_thread_transaction(
 
     let transaction = Transaction::new_signed_with_payer(
         &[instruction],
+        Some(&client.payer.pubkey()),
+        &[&client.payer],
+        blockhash,
+    );
+
+    Ok(transaction)
+}
+
+// ============================================================================
+// Group Chat Transaction Builders
+// ============================================================================
+
+/// Build a CreateGroup instruction
+pub async fn build_create_group_instruction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    encrypted_aes_key: [u8; 48],
+) -> Result<Instruction> {
+    let signer = client.payer.pubkey();
+    let (user_pda, _) = SolcryptClient::get_user_pda(&signer);
+    let (group_pda, _) = SolcryptClient::get_group_pda(&group_id);
+
+    // Get tree info
+    let address_tree_info: TreeInfo = client.rpc.get_address_tree_v1();
+    let state_tree_info = client
+        .rpc
+        .get_random_state_tree_info()
+        .map_err(|e| anyhow::anyhow!("Failed to get state tree info: {:?}", e))?;
+
+    let address_tree_pubkey = address_tree_info.tree;
+    let merkle_tree_pubkey = state_tree_info.tree;
+
+    // Derive the owner's GroupKeyV1 address (key_version = 1 for new group)
+    let key_version_bytes = 1u32.to_le_bytes();
+    let (owner_key_address, _) = derive_address(
+        &[
+            GROUP_KEY_SEED,
+            &group_id,
+            signer.as_ref(),
+            &key_version_bytes,
+        ],
+        &address_tree_pubkey,
+        &solcrypt_program::ID.into(),
+    );
+
+    // Setup packed accounts
+    let system_account_meta_config = SystemAccountMetaConfig::new(solcrypt_program::ID.into());
+    let mut packed_accounts = PackedAccounts::default();
+    packed_accounts.add_pre_accounts_signer(signer);
+    packed_accounts
+        .add_system_accounts(system_account_meta_config)
+        .map_err(|e| anyhow::anyhow!("Failed to add system accounts: {:?}", e))?;
+
+    // Get validity proof for the new address
+    let rpc_result = client
+        .rpc
+        .get_validity_proof(
+            vec![],
+            vec![AddressWithTree {
+                address: owner_key_address,
+                tree: address_tree_pubkey,
+            }],
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get validity proof: {:?}", e))?;
+
+    let output_merkle_tree_index = packed_accounts.insert_or_get(merkle_tree_pubkey);
+    let packed_address_tree_info = rpc_result
+        .value
+        .pack_tree_infos(&mut packed_accounts)
+        .address_trees[0];
+    let (light_accounts, _, _) = packed_accounts.to_account_metas();
+
+    // Build instruction data
+    let instruction_data = CreateGroupData {
+        discriminator: InstructionType::CreateGroup,
+        proof: rpc_result.value.proof.into(),
+        address_tree_info: packed_address_tree_info.into(),
+        output_state_tree_index: output_merkle_tree_index,
+        group_id,
+        encrypted_aes_key,
+    };
+    let data = CreateGroupData::serialize(&instruction_data)
+        .context("Failed to serialize CreateGroupData")?;
+
+    // Build account list
+    let mut accounts = vec![
+        light_accounts[0].clone(), // signer
+        AccountMeta::new(user_pda, false),
+        AccountMeta::new(group_pda, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    accounts.extend(light_accounts[1..].iter().cloned());
+
+    Ok(Instruction {
+        program_id: solcrypt_program::ID.into(),
+        accounts,
+        data,
+    })
+}
+
+/// Create and sign a transaction for creating a group
+pub async fn create_create_group_transaction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    encrypted_aes_key: [u8; 48],
+) -> Result<Transaction> {
+    let instruction = build_create_group_instruction(client, group_id, encrypted_aes_key).await?;
+    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_000_000);
+    let blockhash = client.get_recent_blockhash().await?;
+
+    let transaction = Transaction::new_signed_with_payer(
+        &[compute_budget_ix, instruction],
+        Some(&client.payer.pubkey()),
+        &[&client.payer],
+        blockhash,
+    );
+
+    Ok(transaction)
+}
+
+/// Build an AcceptGroupInvite instruction
+pub fn build_accept_group_invite_instruction(
+    signer: &Pubkey,
+    group_id: [u8; 32],
+) -> Result<Instruction> {
+    let (user_pda, _) = SolcryptClient::get_user_pda(signer);
+
+    let instruction_data = AcceptGroupInviteData {
+        discriminator: InstructionType::AcceptGroupInvite,
+        group_id,
+    };
+    let data = AcceptGroupInviteData::serialize(&instruction_data)
+        .context("Failed to serialize AcceptGroupInviteData")?;
+
+    let accounts = vec![
+        AccountMeta::new(*signer, true),
+        AccountMeta::new(user_pda, false),
+    ];
+
+    Ok(Instruction {
+        program_id: solcrypt_program::ID.into(),
+        accounts,
+        data,
+    })
+}
+
+/// Create and sign a transaction for accepting a group invite
+pub async fn create_accept_group_invite_transaction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+) -> Result<Transaction> {
+    let instruction = build_accept_group_invite_instruction(&client.payer.pubkey(), group_id)?;
+    let blockhash = client.get_recent_blockhash().await?;
+
+    let transaction = Transaction::new_signed_with_payer(
+        &[instruction],
+        Some(&client.payer.pubkey()),
+        &[&client.payer],
+        blockhash,
+    );
+
+    Ok(transaction)
+}
+
+/// Build an InviteToGroup instruction
+/// Invites a new member to the group by creating their GroupKeyV1 with the encrypted AES key
+pub async fn build_invite_to_group_instruction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    invitee: &Pubkey,
+    invitee_encrypted_aes_key: [u8; 48],
+) -> Result<Instruction> {
+    let signer = client.payer.pubkey();
+    let (group_pda, _) = SolcryptClient::get_group_pda(&group_id);
+    let (invitee_user_pda, _) = SolcryptClient::get_user_pda(invitee);
+
+    // Get tree info
+    let address_tree_info: TreeInfo = client.rpc.get_address_tree_v1();
+    let state_tree_info = client
+        .rpc
+        .get_random_state_tree_info()
+        .map_err(|e| anyhow::anyhow!("Failed to get state tree info: {:?}", e))?;
+
+    let address_tree_pubkey = address_tree_info.tree;
+    let merkle_tree_pubkey = state_tree_info.tree;
+
+    // Get the group account to find the current key version
+    let group_account = client
+        .get_group_account(&group_id)
+        .await?
+        .context("Group not found")?;
+
+    // Get inviter's GroupKeyV1 with hash for ZK proof
+    let (inviter_key, inviter_key_address, inviter_key_hash) = client
+        .get_my_group_key_with_hash(&group_id)
+        .await?
+        .context("You are not a member of this group")?;
+
+    // Derive the invitee's GroupKeyV1 address
+    let key_version_bytes = group_account.current_key_version.to_le_bytes();
+    let (invitee_key_address, _) = derive_address(
+        &[
+            GROUP_KEY_SEED,
+            &group_id,
+            invitee.as_ref(),
+            &key_version_bytes,
+        ],
+        &address_tree_pubkey,
+        &solcrypt_program::ID.into(),
+    );
+
+    // Setup packed accounts
+    let system_account_meta_config = SystemAccountMetaConfig::new(solcrypt_program::ID.into());
+    let mut packed_accounts = PackedAccounts::default();
+    packed_accounts.add_pre_accounts_signer(signer);
+    packed_accounts
+        .add_system_accounts(system_account_meta_config)
+        .map_err(|e| anyhow::anyhow!("Failed to add system accounts: {:?}", e))?;
+
+    // Get validity proof for:
+    // 1. Existing inviter's GroupKeyV1 (hash) - proves membership and role
+    // 2. New invitee's GroupKeyV1 address - proves uniqueness
+    let rpc_result = client
+        .rpc
+        .get_validity_proof(
+            vec![inviter_key_hash], // Existing account hash
+            vec![AddressWithTree {
+                address: invitee_key_address,
+                tree: address_tree_pubkey,
+            }],
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get validity proof: {:?}", e))?;
+
+    let output_merkle_tree_index = packed_accounts.insert_or_get(merkle_tree_pubkey);
+
+    let packed_tree_infos = rpc_result.value.pack_tree_infos(&mut packed_accounts);
+
+    // Get the packed account info for inviter's GroupKeyV1
+    let state_trees = packed_tree_infos
+        .state_trees
+        .as_ref()
+        .context("No state trees in proof result")?;
+    let inviter_key_tree_info = state_trees
+        .packed_tree_infos
+        .first()
+        .context("State trees list is empty")?
+        .clone();
+
+    let invitee_address_tree_info = packed_tree_infos.address_trees[0];
+
+    let (light_accounts, _, _) = packed_accounts.to_account_metas();
+
+    // Build the inviter key account meta
+    use solcrypt_program::CompressedAccountMetaCodama;
+
+    let inviter_account_meta = CompressedAccountMetaCodama {
+        tree_info: inviter_key_tree_info.into(),
+        address: inviter_key_address,
+        output_state_tree_index: output_merkle_tree_index,
+    };
+
+    // Build instruction data
+    let instruction_data = InviteToGroupData {
+        discriminator: InstructionType::InviteToGroup,
+        proof: rpc_result.value.proof.into(),
+        inviter_account_meta,
+        inviter_key_version: inviter_key.key_version,
+        inviter_role: inviter_key.role,
+        inviter_encrypted_aes_key: inviter_key.encrypted_aes_key,
+        invitee_address_tree_info: invitee_address_tree_info.into(),
+        output_state_tree_index: output_merkle_tree_index,
+        group_id,
+        invitee: invitee.to_bytes().into(),
+        encrypted_aes_key: invitee_encrypted_aes_key,
+    };
+    let data = InviteToGroupData::serialize(&instruction_data)
+        .context("Failed to serialize InviteToGroupData")?;
+
+    // Build account list
+    let mut accounts = vec![
+        light_accounts[0].clone(), // signer
+        AccountMeta::new_readonly(group_pda, false),
+        AccountMeta::new(invitee_user_pda, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    accounts.extend(light_accounts[1..].iter().cloned());
+
+    Ok(Instruction {
+        program_id: solcrypt_program::ID.into(),
+        accounts,
+        data,
+    })
+}
+
+/// Create and sign a transaction for inviting a member to a group
+pub async fn create_invite_to_group_transaction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    invitee: &Pubkey,
+    invitee_encrypted_aes_key: [u8; 48],
+) -> Result<Transaction> {
+    let instruction =
+        build_invite_to_group_instruction(client, group_id, invitee, invitee_encrypted_aes_key)
+            .await?;
+
+    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_000_000);
+    let blockhash = client.get_recent_blockhash().await?;
+
+    let transaction = Transaction::new_signed_with_payer(
+        &[compute_budget_ix, instruction],
+        Some(&client.payer.pubkey()),
+        &[&client.payer],
+        blockhash,
+    );
+
+    Ok(transaction)
+}
+
+/// Build a SendGroupMessage instruction with membership verification.
+/// The sender's GroupKeyV1 is included in the ZK proof to verify they are a group member.
+pub async fn build_send_group_message_instruction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    sender_key_version: u32,
+    sender_role: u8,
+    sender_encrypted_aes_key: [u8; 48],
+    iv: [u8; 12],
+    ciphertext: Vec<u8>,
+) -> Result<Instruction> {
+    let signer = client.payer.pubkey();
+    let (group_pda, _) = SolcryptClient::get_group_pda(&group_id);
+
+    // Get tree info
+    let address_tree_info: TreeInfo = client.rpc.get_address_tree_v1();
+    let state_tree_info = client
+        .rpc
+        .get_random_state_tree_info()
+        .map_err(|e| anyhow::anyhow!("Failed to get state tree info: {:?}", e))?;
+
+    let address_tree_pubkey = address_tree_info.tree;
+    let merkle_tree_pubkey = state_tree_info.tree;
+
+    // Generate random nonce for message
+    let nonce = random_nonce();
+
+    // Derive the message address
+    let (msg_address, _) = derive_address(
+        &[b"group-msg", &group_id, &nonce],
+        &address_tree_pubkey,
+        &solcrypt_program::ID.into(),
+    );
+
+    // Get the sender's GroupKeyV1 hash for membership verification
+    let (group_key, key_address, key_hash) = client
+        .get_my_group_key_with_hash(&group_id)
+        .await?
+        .context("You are not a member of this group")?;
+
+    // Setup packed accounts
+    let system_account_meta_config = SystemAccountMetaConfig::new(solcrypt_program::ID.into());
+    let mut packed_accounts = PackedAccounts::default();
+    packed_accounts.add_pre_accounts_signer(signer);
+    packed_accounts
+        .add_system_accounts(system_account_meta_config)
+        .map_err(|e| anyhow::anyhow!("Failed to add system accounts: {:?}", e))?;
+
+    // Get validity proof for:
+    // 1. Existing sender's GroupKeyV1 (hash) - proves membership
+    // 2. New message address - proves uniqueness
+    let rpc_result = client
+        .rpc
+        .get_validity_proof(
+            vec![key_hash], // Existing account hash for membership verification
+            vec![AddressWithTree {
+                address: msg_address,
+                tree: address_tree_pubkey,
+            }],
+            None,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get validity proof: {:?}", e))?;
+
+    let output_merkle_tree_index = packed_accounts.insert_or_get(merkle_tree_pubkey);
+
+    let packed_tree_infos = rpc_result.value.pack_tree_infos(&mut packed_accounts);
+
+    // Get the packed account info for sender's GroupKeyV1
+    let state_trees = packed_tree_infos
+        .state_trees
+        .as_ref()
+        .context("No state trees in proof result")?;
+    let sender_key_tree_info = state_trees
+        .packed_tree_infos
+        .first()
+        .context("State trees list is empty")?
+        .clone();
+
+    let message_address_tree_info = packed_tree_infos.address_trees[0];
+
+    let (light_accounts, _, _) = packed_accounts.to_account_metas();
+
+    // Build the sender key account meta with proper tree info
+    use solcrypt_program::CompressedAccountMetaCodama;
+
+    let sender_key_account_meta = CompressedAccountMetaCodama {
+        tree_info: sender_key_tree_info.into(),
+        address: key_address,
+        output_state_tree_index: output_merkle_tree_index,
+    };
+
+    // Build instruction data with real membership proof
+    let instruction_data = SendGroupMessageData {
+        discriminator: InstructionType::SendGroupMessage,
+        proof: rpc_result.value.proof.into(),
+        sender_key_account_meta,
+        sender_key_version: group_key.key_version,
+        sender_role: group_key.role,
+        sender_encrypted_aes_key: group_key.encrypted_aes_key,
+        message_address_tree_info: message_address_tree_info.into(),
+        output_state_tree_index: output_merkle_tree_index,
+        group_id,
+        iv,
+        ciphertext,
+        nonce,
+    };
+    let data = SendGroupMessageData::serialize(&instruction_data)
+        .context("Failed to serialize SendGroupMessageData")?;
+
+    // Build account list
+    let mut accounts = vec![
+        light_accounts[0].clone(), // signer
+        AccountMeta::new_readonly(group_pda, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    accounts.extend(light_accounts[1..].iter().cloned());
+
+    Ok(Instruction {
+        program_id: solcrypt_program::ID.into(),
+        accounts,
+        data,
+    })
+}
+
+/// Create and sign a transaction for sending a group message
+pub async fn create_send_group_message_transaction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    sender_key_version: u32,
+    sender_role: u8,
+    sender_encrypted_aes_key: [u8; 48],
+    iv: [u8; 12],
+    ciphertext: Vec<u8>,
+) -> Result<Transaction> {
+    let instruction = build_send_group_message_instruction(
+        client,
+        group_id,
+        sender_key_version,
+        sender_role,
+        sender_encrypted_aes_key,
+        iv,
+        ciphertext,
+    )
+    .await?;
+
+    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_000_000);
+    let blockhash = client.get_recent_blockhash().await?;
+
+    let transaction = Transaction::new_signed_with_payer(
+        &[compute_budget_ix, instruction],
         Some(&client.payer.pubkey()),
         &[&client.payer],
         blockhash,

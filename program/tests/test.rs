@@ -4,6 +4,7 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, OsRng, rand_core::RngCore},
 };
+use light_client::indexer::CompressedAccount;
 use light_program_test::{
     AddressWithTree, Indexer, ProgramTestConfig, Rpc, RpcError, program_test::LightProgramTest,
 };
@@ -18,10 +19,11 @@ use solana_sdk::{
 };
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use solcrypt_program::{
-    AcceptGroupInviteData, AcceptThreadData, AddThreadData, ClientSideMessage, CreateGroupData,
-    GROUP_KEY_SEED, GROUP_SEED, GroupAccount, GroupKeyV1, InitUserData, InstructionType, MsgV1,
-    ROLE_OWNER, RemoveThreadData, SendDmMessageData, THREAD_STATE_GROUP_ACCEPTED, USER_SEED,
-    UserAccount,
+    AcceptGroupInviteData, AcceptThreadData, AddThreadData, ClientSideMessage,
+    CompressedAccountMetaCodama, CreateGroupData, GROUP_KEY_SEED, GROUP_SEED, GroupAccount,
+    GroupKeyV1, InitUserData, InstructionType, InviteToGroupData, MsgV1, ROLE_MEMBER, ROLE_OWNER,
+    RemoveThreadData, SendDmMessageData, THREAD_STATE_GROUP_ACCEPTED, THREAD_STATE_GROUP_PENDING,
+    USER_SEED, UserAccount,
 };
 use wincode::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
@@ -540,48 +542,91 @@ async fn test_solcrypt_group() {
     println!("  ✓ Group thread added to owner's UserAccount (ACCEPTED)");
 
     // ========================================================================
-    // Test 3: Accept Group Invite
+    // Test 3: Invite Member to Group
     // ========================================================================
-    // Note: In a full test, we would first invite member1, but that requires
-    // reading the owner's compressed account which needs additional setup.
-    // For now, we test accept_group_invite by manually adding a pending thread.
-    println!("Test 3: Accept group invite flow...");
+    println!("Test 3: Invite member1 to group...");
 
-    // Manually add a pending group thread to member1 (simulating an invite)
-    add_thread(
-        &member1_keypair,
+    // Get the owner's GroupKeyV1 compressed account (with hash for ZK proof)
+    let owner_key_account = rpc
+        .get_compressed_account(owner_key_address, None)
+        .await
+        .unwrap()
+        .value
+        .unwrap();
+
+    // Derive the member1's GroupKeyV1 address
+    let (member1_key_address, _) = derive_address(
+        &[
+            GROUP_KEY_SEED,
+            &group_id,
+            member1_keypair.pubkey().as_ref(),
+            &key_version_bytes,
+        ],
+        &address_tree_pubkey,
+        &program_id,
+    );
+
+    // Encrypt the AES key for member1
+    let member1_encrypted_key =
+        encrypt_aes_key_for_member(&group_aes_key, &member1_x25519_public.to_bytes());
+
+    // Call invite_to_group - passing the full compressed account
+    invite_to_group(
+        &payer,
         &mut rpc,
+        address_tree_pubkey,
+        &owner_key_account,
+        member1_key_address,
         group_id,
-        solcrypt_program::THREAD_STATE_GROUP_PENDING,
+        member1_keypair.pubkey(),
+        member1_encrypted_key,
     )
     .await
     .unwrap();
 
-    // Member1 accepts the invite
+    // Verify member1's GroupKeyV1 was created
+    let member1_key_account = rpc
+        .get_compressed_account(member1_key_address, None)
+        .await
+        .unwrap()
+        .value
+        .unwrap();
+    let member1_key =
+        GroupKeyV1::deserialize(&mut member1_key_account.data.as_ref().unwrap().data.as_slice())
+            .unwrap();
+    assert_eq!(member1_key.group_id, group_id);
+    assert_eq!(member1_key.role, ROLE_MEMBER);
+    println!("  ✓ Member1's GroupKeyV1 created with ROLE_MEMBER");
+
+    // Verify thread was added to member1's UserAccount (PENDING)
+    let (member1_pda, _) = get_user_pda(&member1_keypair.pubkey(), &program_id);
+    let member1_user_data = rpc.get_account(member1_pda).await.unwrap().unwrap();
+    let member1_user = UserAccount::deserialize(&mut &member1_user_data.data[..]).unwrap();
+    assert_eq!(member1_user.threads.len(), 1);
+    assert_eq!(member1_user.threads[0].thread_id, group_id);
+    assert_eq!(member1_user.threads[0].state, THREAD_STATE_GROUP_PENDING);
+    println!("  ✓ Group thread added to member1's UserAccount (PENDING)");
+
+    // ========================================================================
+    // Test 4: Member1 accepts the invite
+    // ========================================================================
+    println!("Test 4: Member1 accepts group invite...");
+
     accept_group_invite(&member1_keypair, &mut rpc, group_id)
         .await
         .unwrap();
 
     // Verify thread was accepted
-    let (member1_pda, _) = get_user_pda(&member1_keypair.pubkey(), &program_id);
     let member1_user_data = rpc.get_account(member1_pda).await.unwrap().unwrap();
     let member1_user = UserAccount::deserialize(&mut &member1_user_data.data[..]).unwrap();
     assert_eq!(member1_user.threads[0].state, THREAD_STATE_GROUP_ACCEPTED);
     assert!(member1_user.threads[0].is_accepted());
     println!("  ✓ Member1 accepted group invite");
 
-    // ========================================================================
-    // Test 4: Send Second Message (uses non-zero nonce)
-    // ========================================================================
-    // Note: Sending group messages requires reading the sender's compressed
-    // GroupKeyV1 account for membership verification. This is more complex
-    // and would require additional test infrastructure for proof generation.
-    // The create_group and accept_group_invite tests verify the core group
-    // functionality. Full message sending would be tested in integration tests.
-
     println!("\n✅ All group tests passed!");
     println!("  - Group creation with owner's GroupKeyV1 ✓");
     println!("  - Group thread tracking in UserAccount ✓");
+    println!("  - Invite member with ZK proof verification ✓");
     println!("  - Group invite acceptance flow ✓");
 }
 
@@ -936,6 +981,119 @@ pub async fn accept_group_invite(
     };
 
     rpc.create_and_send_transaction(&[instruction], &user.pubkey(), &[user])
+        .await?;
+    Ok(())
+}
+
+/// Invite a member to a group
+#[allow(clippy::too_many_arguments)]
+pub async fn invite_to_group(
+    inviter: &Keypair,
+    rpc: &mut LightProgramTest,
+    address_tree_pubkey: Pubkey,
+    inviter_compressed_account: &CompressedAccount,
+    invitee_key_address: [u8; 32],
+    group_id: [u8; 32],
+    invitee: Pubkey,
+    encrypted_aes_key: [u8; 48],
+) -> Result<(), RpcError> {
+    let program_id: Pubkey = solcrypt_program::ID.into();
+
+    // Get PDAs
+    let (group_pda, _) = get_group_pda(&group_id, &program_id);
+    let (invitee_user_pda, _) = get_user_pda(&invitee, &program_id);
+
+    let system_account_meta_config = SystemAccountMetaConfig::new(program_id);
+    let mut packed_accounts = PackedAccounts::default();
+    packed_accounts.add_pre_accounts_signer(inviter.pubkey());
+    packed_accounts.add_system_accounts(system_account_meta_config)?;
+
+    // Get the hash from the compressed account
+    let inviter_key_hash = inviter_compressed_account.hash;
+
+    // Deserialize the inviter's GroupKeyV1 to get the current values
+    let inviter_key = GroupKeyV1::deserialize(
+        &mut inviter_compressed_account
+            .data
+            .as_ref()
+            .unwrap()
+            .data
+            .as_slice(),
+    )
+    .unwrap();
+
+    println!("  Sending invite_to_group instruction...");
+
+    // Get validity proof for:
+    // 1. Existing inviter's GroupKeyV1 (hash) - proves membership and role
+    // 2. New invitee's GroupKeyV1 address - proves uniqueness
+    let rpc_result = rpc
+        .get_validity_proof(
+            vec![inviter_key_hash], // Existing account hash
+            vec![AddressWithTree {
+                address: invitee_key_address,
+                tree: address_tree_pubkey,
+            }],
+            None,
+        )
+        .await?
+        .value;
+
+    // Pack tree infos - this gives us the correct indices
+    let packed_tree_infos = rpc_result.pack_tree_infos(&mut packed_accounts);
+
+    // Get the state tree info for inviter's existing account
+    let state_trees = packed_tree_infos.state_trees.as_ref().unwrap();
+    let inviter_tree_info = state_trees.packed_tree_infos[0].clone();
+    let output_state_tree_index = state_trees.output_tree_index;
+
+    let invitee_address_tree_info = packed_tree_infos.address_trees[0];
+
+    let (light_accounts, _, _) = packed_accounts.to_account_metas();
+
+    // Build the inviter account meta using data from the compressed account
+    let inviter_account_meta = CompressedAccountMetaCodama {
+        tree_info: inviter_tree_info.into(),
+        address: inviter_compressed_account.address.unwrap(),
+        output_state_tree_index,
+    };
+
+    // Build account list:
+    // [0] = signer
+    // [1] = group_pda
+    // [2] = invitee_user_pda
+    // [3] = system_program
+    // [4..] = Light Protocol accounts
+    let mut accounts = vec![
+        light_accounts[0].clone(), // signer
+        AccountMeta::new_readonly(group_pda, false),
+        AccountMeta::new(invitee_user_pda, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    accounts.extend(light_accounts[1..].iter().cloned());
+
+    let instruction_data = InviteToGroupData {
+        discriminator: InstructionType::InviteToGroup,
+        proof: rpc_result.proof.into(),
+        inviter_account_meta,
+        inviter_key_version: inviter_key.key_version,
+        inviter_role: inviter_key.role,
+        inviter_encrypted_aes_key: inviter_key.encrypted_aes_key,
+        invitee_address_tree_info: invitee_address_tree_info.into(),
+        output_state_tree_index,
+        group_id,
+        invitee: invitee.to_bytes().into(),
+        encrypted_aes_key,
+    };
+    let inputs = InviteToGroupData::serialize(&instruction_data).unwrap();
+
+    let instruction = Instruction {
+        program_id,
+        accounts,
+        data: inputs,
+    };
+
+    rpc.create_and_send_transaction(&[instruction], &inviter.pubkey(), &[inviter])
         .await?;
     Ok(())
 }

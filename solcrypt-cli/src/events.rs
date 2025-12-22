@@ -3,7 +3,7 @@
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
 use std::time::Duration;
 
-use crate::app::{App, InputMode, Screen};
+use crate::app::{App, InputMode, ListTab, Screen};
 
 /// Result type for event handling
 pub enum EventResult {
@@ -13,14 +13,26 @@ pub enum EventResult {
     RefreshChats,
     /// Open selected chat
     OpenChat,
+    /// Open selected group
+    OpenGroup,
     /// Send message with content
     SendMessage(String),
+    /// Send group message with content
+    SendGroupMessage(String),
     /// Start new chat with recipient
     StartNewChat(String),
+    /// Create new group
+    CreateGroup,
     /// Accept pending chat
     AcceptChat,
+    /// Accept pending group invite
+    AcceptGroupInvite,
     /// Load messages for current chat
     LoadMessages,
+    /// Load messages for current group
+    LoadGroupMessages,
+    /// Invite member to current group
+    InviteMember(String),
 }
 
 /// Poll for events with timeout
@@ -43,7 +55,10 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
     match &app.screen {
         Screen::ChatList => handle_chat_list_keys(app, key),
         Screen::Chat { .. } => handle_chat_keys(app, key),
+        Screen::GroupChat { .. } => handle_group_chat_keys(app, key),
         Screen::NewChat => handle_new_chat_keys(app, key),
+        Screen::NewGroup => handle_new_group_keys(app, key),
+        Screen::InviteMember { .. } => handle_invite_member_keys(app, key),
         Screen::Loading { .. } => EventResult::Continue,
         Screen::Error { .. } => {
             // Any key dismisses error
@@ -60,32 +75,70 @@ fn handle_chat_list_keys(app: &mut App, key: KeyEvent) -> EventResult {
             app.should_quit = true;
             EventResult::Continue
         }
+        KeyCode::Tab => {
+            app.next_tab();
+            EventResult::Continue
+        }
         KeyCode::Up | KeyCode::Char('k') => {
-            app.select_prev();
+            match app.list_tab {
+                ListTab::Chats => app.select_prev(),
+                ListTab::Groups => app.select_prev_group(),
+            }
             EventResult::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            app.select_next();
+            match app.list_tab {
+                ListTab::Chats => app.select_next(),
+                ListTab::Groups => app.select_next_group(),
+            }
             EventResult::Continue
         }
-        KeyCode::Enter => {
-            if app.total_chats() > 0 {
-                EventResult::OpenChat
-            } else {
-                EventResult::Continue
+        KeyCode::Enter => match app.list_tab {
+            ListTab::Chats => {
+                if app.total_chats() > 0 {
+                    EventResult::OpenChat
+                } else {
+                    EventResult::Continue
+                }
             }
-        }
+            ListTab::Groups => {
+                if app.total_groups() > 0 {
+                    EventResult::OpenGroup
+                } else {
+                    EventResult::Continue
+                }
+            }
+        },
         KeyCode::Char('n') => {
-            app.navigate_to(Screen::NewChat);
-            app.input_mode = InputMode::Editing;
+            match app.list_tab {
+                ListTab::Chats => {
+                    app.navigate_to(Screen::NewChat);
+                    app.input_mode = InputMode::Editing;
+                }
+                ListTab::Groups => {
+                    app.navigate_to(Screen::NewGroup);
+                    app.input_mode = InputMode::Editing;
+                }
+            }
             EventResult::Continue
         }
         KeyCode::Char('r') => EventResult::RefreshChats,
         KeyCode::Char('a') => {
-            // Accept pending chat
-            if let Some(chat) = app.get_selected_chat() {
-                if !chat.is_accepted {
-                    return EventResult::AcceptChat;
+            // Accept pending chat or group
+            match app.list_tab {
+                ListTab::Chats => {
+                    if let Some(chat) = app.get_selected_chat() {
+                        if !chat.is_accepted {
+                            return EventResult::AcceptChat;
+                        }
+                    }
+                }
+                ListTab::Groups => {
+                    if let Some(group) = app.get_selected_group() {
+                        if !group.is_accepted {
+                            return EventResult::AcceptGroupInvite;
+                        }
+                    }
                 }
             }
             EventResult::Continue
@@ -173,6 +226,135 @@ fn handle_new_chat_keys(app: &mut App, key: KeyEvent) -> EventResult {
                 app.input.clear();
                 app.cursor_position = 0;
                 EventResult::StartNewChat(recipient)
+            } else {
+                EventResult::Continue
+            }
+        }
+        KeyCode::Char(c) => {
+            app.enter_char(c);
+            EventResult::Continue
+        }
+        KeyCode::Backspace => {
+            app.delete_char();
+            EventResult::Continue
+        }
+        KeyCode::Left => {
+            app.move_cursor_left();
+            EventResult::Continue
+        }
+        KeyCode::Right => {
+            app.move_cursor_right();
+            EventResult::Continue
+        }
+        _ => EventResult::Continue,
+    }
+}
+
+/// Handle keys in group chat view
+fn handle_group_chat_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    match app.input_mode {
+        InputMode::Normal => match key.code {
+            KeyCode::Char('q') => {
+                app.should_quit = true;
+                EventResult::Continue
+            }
+            KeyCode::Esc => {
+                app.clear_current_group();
+                app.navigate_to(Screen::ChatList);
+                EventResult::RefreshChats
+            }
+            KeyCode::Char('i') => {
+                app.input_mode = InputMode::Editing;
+                EventResult::Continue
+            }
+            KeyCode::Char('a') => {
+                // Open invite member dialog
+                if let Screen::GroupChat { group_id } = app.screen {
+                    app.navigate_to(Screen::InviteMember { group_id });
+                    app.input_mode = InputMode::Editing;
+                }
+                EventResult::Continue
+            }
+            KeyCode::Char('r') => EventResult::LoadGroupMessages,
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.scroll_up();
+                EventResult::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.scroll_down();
+                EventResult::Continue
+            }
+            _ => EventResult::Continue,
+        },
+        InputMode::Editing => match key.code {
+            KeyCode::Esc => {
+                app.input_mode = InputMode::Normal;
+                app.input.clear();
+                app.cursor_position = 0;
+                EventResult::Continue
+            }
+            KeyCode::Enter => {
+                if !app.input.is_empty() {
+                    let message = app.input.clone();
+                    app.input.clear();
+                    app.cursor_position = 0;
+                    app.input_mode = InputMode::Normal;
+                    EventResult::SendGroupMessage(message)
+                } else {
+                    EventResult::Continue
+                }
+            }
+            KeyCode::Char(c) => {
+                app.enter_char(c);
+                EventResult::Continue
+            }
+            KeyCode::Backspace => {
+                app.delete_char();
+                EventResult::Continue
+            }
+            KeyCode::Left => {
+                app.move_cursor_left();
+                EventResult::Continue
+            }
+            KeyCode::Right => {
+                app.move_cursor_right();
+                EventResult::Continue
+            }
+            _ => EventResult::Continue,
+        },
+    }
+}
+
+/// Handle keys in new group dialog
+fn handle_new_group_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    match key.code {
+        KeyCode::Esc => {
+            app.go_back();
+            EventResult::Continue
+        }
+        KeyCode::Enter => {
+            // Create group doesn't need input, just press enter
+            app.input.clear();
+            app.cursor_position = 0;
+            EventResult::CreateGroup
+        }
+        _ => EventResult::Continue,
+    }
+}
+
+/// Handle keys in invite member dialog
+fn handle_invite_member_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    match key.code {
+        KeyCode::Esc => {
+            app.go_back();
+            EventResult::Continue
+        }
+        KeyCode::Enter => {
+            if !app.input.is_empty() {
+                let invitee_pubkey = app.input.clone();
+                app.input.clear();
+                app.cursor_position = 0;
+                EventResult::InviteMember(invitee_pubkey)
             } else {
                 EventResult::Continue
             }

@@ -21,7 +21,10 @@ use solana_sdk::{
     signer::Signer,
     transaction::Transaction,
 };
-use solcrypt_program::{MsgV1, ThreadEntry, UserAccount, THREAD_STATE_ACCEPTED, USER_SEED};
+use solcrypt_program::{
+    GroupAccount, GroupKeyV1, GroupMsgV1, MsgV1, ThreadEntry, UserAccount, GROUP_KEY_SEED,
+    GROUP_SEED, USER_SEED,
+};
 use wincode::Deserialize as WincodeDeserialize;
 
 // ============================================================================
@@ -176,8 +179,205 @@ impl SolcryptClient {
         Ok(account.map(|a| a.x25519_pubkey))
     }
 
-    /// Get threads for the current user, separated by status
-    pub async fn get_threads(&self) -> Result<(Vec<ThreadEntry>, Vec<ThreadEntry>)> {
+    // ========================================================================
+    // Group Account Functions
+    // ========================================================================
+
+    /// Derive the GroupAccount PDA for a given group ID
+    pub fn get_group_pda(group_id: &[u8; 32]) -> (Pubkey, u8) {
+        Pubkey::find_program_address(
+            &[GROUP_SEED, group_id.as_ref()],
+            &solcrypt_program::ID.into(),
+        )
+    }
+
+    /// Fetch a group account
+    pub async fn get_group_account(&self, group_id: &[u8; 32]) -> Result<Option<GroupAccount>> {
+        let (pda, _) = Self::get_group_pda(group_id);
+        let account = self
+            .rpc
+            .get_account(pda)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get group account: {:?}", e))?;
+
+        match account {
+            Some(acc) => {
+                let group_account = GroupAccount::deserialize(acc.data.as_slice())
+                    .context("Failed to deserialize GroupAccount")?;
+                Ok(Some(group_account))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch the current user's GroupKeyV1 for a group
+    /// Returns the GroupKeyV1 data, address, and hash (for ZK proofs)
+    pub async fn get_my_group_key(
+        &self,
+        group_id: &[u8; 32],
+    ) -> Result<Option<(GroupKeyV1, [u8; 32])>> {
+        // Get the group account to know the current key version
+        let group_account = match self.get_group_account(group_id).await? {
+            Some(acc) => acc,
+            None => return Ok(None),
+        };
+
+        // Derive the address for the user's GroupKeyV1
+        let address_tree_info = self.rpc.get_address_tree_v1();
+        let key_version_bytes = group_account.current_key_version.to_le_bytes();
+
+        let (key_address, _) = derive_address(
+            &[
+                GROUP_KEY_SEED,
+                group_id,
+                self.payer.pubkey().as_ref(),
+                &key_version_bytes,
+            ],
+            &address_tree_info.tree,
+            &solcrypt_program::ID.into(),
+        );
+
+        // Fetch the compressed account
+        match self
+            .rpc
+            .get_compressed_account(key_address, None)
+            .await?
+            .value
+        {
+            Some(account) => {
+                let group_key =
+                    GroupKeyV1::deserialize(&account.data.as_ref().unwrap().data.as_slice())
+                        .context("Failed to deserialize GroupKeyV1")?;
+
+                Ok(Some((group_key, key_address)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Fetch GroupKeyV1 with full account metadata for ZK proofs
+    /// Returns: (GroupKeyV1, address, hash)
+    pub async fn get_my_group_key_with_hash(
+        &self,
+        group_id: &[u8; 32],
+    ) -> Result<Option<(GroupKeyV1, [u8; 32], [u8; 32])>> {
+        // Get the group account to know the current key version
+        let group_account = match self.get_group_account(group_id).await? {
+            Some(acc) => acc,
+            None => return Ok(None),
+        };
+
+        // Derive the address for the user's GroupKeyV1
+        let address_tree_info = self.rpc.get_address_tree_v1();
+        let key_version_bytes = group_account.current_key_version.to_le_bytes();
+
+        let (key_address, _) = derive_address(
+            &[
+                GROUP_KEY_SEED,
+                group_id,
+                self.payer.pubkey().as_ref(),
+                &key_version_bytes,
+            ],
+            &address_tree_info.tree,
+            &solcrypt_program::ID.into(),
+        );
+
+        // Fetch the compressed account
+        match self
+            .rpc
+            .get_compressed_account(key_address, None)
+            .await?
+            .value
+        {
+            Some(account) => {
+                let group_key =
+                    GroupKeyV1::deserialize(&account.data.as_ref().unwrap().data.as_slice())
+                        .context("Failed to deserialize GroupKeyV1")?;
+
+                Ok(Some((group_key, key_address, account.hash)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get validity proof for an existing compressed account (for updates/closes)
+    pub async fn get_validity_proof_for_account(
+        &self,
+        address: [u8; 32],
+    ) -> Result<ValidityProofWithContext> {
+        // For reading existing accounts, we put the address in the first vec (hashes)
+        let result = self
+            .rpc
+            .get_validity_proof(vec![address], vec![], None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get validity proof: {:?}", e))?;
+
+        Ok(result.value)
+    }
+
+    /// Fetch group messages for a group
+    pub async fn get_group_messages(&self, group_id: &[u8; 32]) -> Result<Vec<GroupMsgV1>> {
+        let messages = self
+            .rpc
+            .get_compressed_accounts_by_owner(
+                &solcrypt_program::ID.into(),
+                Some(GetCompressedAccountsByOwnerConfig {
+                    filters: Some(vec![GetCompressedAccountsFilter {
+                        bytes: group_id.to_vec(),
+                        offset: 1, // After discriminator
+                    }]),
+                    data_slice: None,
+                    cursor: None,
+                    limit: None,
+                }),
+                None,
+            )
+            .await?;
+
+        let mut msgs: Vec<GroupMsgV1> = messages
+            .value
+            .items
+            .iter()
+            .filter_map(|acc| {
+                // Filter for GroupMsgV1 accounts (discriminator = 4)
+                let data = acc.data.as_ref()?.data.as_slice();
+                if data.is_empty() || data[0] != 4 {
+                    return None;
+                }
+                GroupMsgV1::deserialize(data).ok()
+            })
+            .collect();
+
+        msgs.sort_by_key(|m| m.unix_timestamp);
+        Ok(msgs)
+    }
+
+    /// Derive GroupKeyV1 address for a member
+    pub fn derive_group_key_address(
+        &self,
+        group_id: &[u8; 32],
+        member: &Pubkey,
+        key_version: u32,
+    ) -> [u8; 32] {
+        let address_tree_info = self.rpc.get_address_tree_v1();
+        let key_version_bytes = key_version.to_le_bytes();
+
+        let (address, _) = derive_address(
+            &[
+                GROUP_KEY_SEED,
+                group_id,
+                member.as_ref(),
+                &key_version_bytes,
+            ],
+            &address_tree_info.tree,
+            &solcrypt_program::ID.into(),
+        );
+
+        address
+    }
+
+    /// Get DM threads for the current user, separated by status
+    pub async fn get_dm_threads(&self) -> Result<(Vec<ThreadEntry>, Vec<ThreadEntry>)> {
         let account = self
             .get_user_account(&self.payer.pubkey())
             .await?
@@ -187,7 +387,11 @@ impl SolcryptClient {
         let mut pending = Vec::new();
 
         for thread in account.threads {
-            if thread.state == THREAD_STATE_ACCEPTED {
+            // Skip group threads
+            if thread.is_group() {
+                continue;
+            }
+            if thread.is_accepted() {
                 accepted.push(thread);
             } else {
                 pending.push(thread);
@@ -195,6 +399,36 @@ impl SolcryptClient {
         }
 
         Ok((accepted, pending))
+    }
+
+    /// Get group threads for the current user, separated by status
+    pub async fn get_group_threads(&self) -> Result<(Vec<ThreadEntry>, Vec<ThreadEntry>)> {
+        let account = self
+            .get_user_account(&self.payer.pubkey())
+            .await?
+            .context("User account not initialized")?;
+
+        let mut accepted = Vec::new();
+        let mut pending = Vec::new();
+
+        for thread in account.threads {
+            // Only include group threads
+            if !thread.is_group() {
+                continue;
+            }
+            if thread.is_accepted() {
+                accepted.push(thread);
+            } else {
+                pending.push(thread);
+            }
+        }
+
+        Ok((accepted, pending))
+    }
+
+    /// Get all threads for the current user (legacy, for compatibility)
+    pub async fn get_threads(&self) -> Result<(Vec<ThreadEntry>, Vec<ThreadEntry>)> {
+        self.get_dm_threads().await
     }
 
     /// Get validity proof for creating a new compressed account at the given address
@@ -335,4 +569,10 @@ pub fn format_pubkey(pubkey: &Pubkey) -> String {
 pub fn format_thread_id(thread_id: &[u8; 32]) -> String {
     let hex = hex::encode(thread_id);
     format!("{}...{}", &hex[..8], &hex[hex.len() - 8..])
+}
+
+/// Format a group ID for display (abbreviated hex)
+pub fn format_group_id(group_id: &[u8; 32]) -> String {
+    let hex = hex::encode(group_id);
+    format!("Group {}..{}", &hex[..6], &hex[hex.len() - 4..])
 }
