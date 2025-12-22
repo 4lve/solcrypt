@@ -22,16 +22,19 @@ use crossterm::{
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 use solana_sdk::{pubkey::Pubkey, signature::read_keypair_file};
+use solcrypt_program::ClientSideMessage;
 use x25519_dalek::PublicKey as X25519PublicKey;
 
 use app::{App, Screen};
 use client::SolcryptClient;
-use crypto::{compute_thread_id, derive_aes_key, derive_x25519_keypair, Message};
+use crypto::{compute_thread_id, derive_aes_key, derive_x25519_keypair};
 use events::{handle_key_event, poll_event, EventResult};
 use instructions::{
     create_accept_thread_transaction, create_init_user_transaction,
     create_send_dm_message_transaction,
 };
+
+use crate::crypto::ClientSideMessageExt;
 
 /// Solcrypt CLI - End-to-End Encrypted Messaging on Solana
 #[derive(Parser)]
@@ -325,7 +328,7 @@ async fn send_message(
     let thread_id = compute_thread_id(&client.pubkey(), recipient);
 
     // Encrypt message
-    let message = Message::text(content);
+    let message = ClientSideMessage::Text(content.to_string());
     let (iv, ciphertext) = message.encrypt(&aes_key)?;
 
     // Send transaction

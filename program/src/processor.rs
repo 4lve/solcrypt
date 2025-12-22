@@ -1,46 +1,20 @@
-use borsh::{BorshDeserialize, BorshSerialize};
-use light_sdk_pinocchio::{
-    LightAccount,
-    address::v1::derive_address,
-    cpi::{
-        CpiAccountsConfig, InvokeLightSystemProgram, LightCpiInstruction,
-        v1::{CpiAccounts, LightSystemProgramCpi},
-    },
-    instruction::PackedAddressTreeInfo,
-};
 use pinocchio::{
-    ProgramResult,
-    account_info::AccountInfo,
-    instruction::Signer,
     program_error::ProgramError,
     pubkey::Pubkey,
-    seeds,
-    sysvars::{Sysvar, clock::Clock},
 };
-use pinocchio_system::instructions::{CreateAccount, Transfer};
 
-use crate::{
-    constants::{
-        ID, INITIAL_THREAD_CAPACITY, LIGHT_CPI_SIGNER, THREAD_STATE_ACCEPTED, THREAD_STATE_PENDING,
-        USER_SEED,
-    },
-    error::SolcryptError,
-    instruction::{
-        AcceptThreadData, AddThreadData, InitUserData, RemoveThreadData, SendDmMessageData,
-    },
-    state::{MsgV1, ThreadEntry, UserAccount},
-};
+use crate::constants::USER_SEED;
 
 // ============================================================================
 // Helper Functions
 // ============================================================================
 
 pub fn to_custom_error<E: Into<u64>>(e: E) -> ProgramError {
-    ProgramError::Custom(u64::from(e.into()) as u32)
+    ProgramError::Custom(e.into() as u32)
 }
 
 pub fn to_custom_error_u32<E: Into<u32>>(e: E) -> ProgramError {
-    ProgramError::Custom(u32::from(e.into()))
+    ProgramError::Custom(e.into())
 }
 
 /// Derives the UserAccount PDA address
@@ -50,6 +24,7 @@ pub fn get_user_pda(user: &Pubkey, program_id: &Pubkey) -> (Pubkey, u8) {
 
 /// Helper to add a thread to a UserAccount PDA.
 /// Handles resize if needed. Skips if thread already exists (idempotent).
+#[cfg(feature = "bpf-entrypoint")]
 fn add_thread_to_user_account(
     payer: &AccountInfo,
     user_pda: &AccountInfo,
@@ -61,7 +36,7 @@ fn add_thread_to_user_account(
     // Deserialize current account data
     let data = user_pda.try_borrow_data()?;
     let mut user_account =
-        UserAccount::deserialize(&mut &data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
+        UserAccount::deserialize(&data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
     drop(data);
 
     // Skip if thread already exists (idempotent)
@@ -109,8 +84,7 @@ fn add_thread_to_user_account(
 
     // Serialize and write updated data
     let mut data = user_pda.try_borrow_mut_data()?;
-    user_account
-        .serialize(&mut &mut data[..])
+    UserAccount::serialize_into(&mut &mut data[..], &user_account)
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
     Ok(())
@@ -128,9 +102,11 @@ fn add_thread_to_user_account(
 /// O(1) client-side lookup of the first message by deriving its address
 /// deterministically. Subsequent messages must use non-zero nonces to avoid
 /// address collisions.
+#[inline(never)]
+#[cfg(feature = "bpf-entrypoint")]
 pub fn send_dm_message(
     accounts: &[AccountInfo],
-    instruction_data: SendDmMessageData,
+    instruction_data: Box<SendDmMessageData>,
 ) -> ProgramResult {
     let signer = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let sender_user_pda = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -164,8 +140,8 @@ pub fn send_dm_message(
 
     // Check if this is the first message in the thread (thread doesn't exist in sender's account)
     let sender_data = sender_user_pda.try_borrow_data()?;
-    let sender_account = UserAccount::deserialize(&mut &sender_data[..])
-        .map_err(|_| ProgramError::InvalidAccountData)?;
+    let sender_account =
+        UserAccount::deserialize(&sender_data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
     let is_first_message = !sender_account
         .threads
         .iter()
@@ -199,7 +175,7 @@ pub fn send_dm_message(
     // Derive unique address for this message using thread_id + nonce
     let (address, address_seed) = derive_address(
         &[b"msg", &instruction_data.thread_id, &instruction_data.nonce],
-        &tree_pubkey,
+        tree_pubkey,
         &program_id,
     );
 
@@ -225,7 +201,7 @@ pub fn send_dm_message(
     LightSystemProgramCpi::new_cpi(LIGHT_CPI_SIGNER, instruction_data.proof.into())
         .with_light_account(msg)
         .map_err(to_custom_error)?
-        .with_new_addresses(&[new_address_params.into()])
+        .with_new_addresses(&[new_address_params])
         .invoke(cpi_accounts)?;
 
     // Add thread to sender's UserAccount (state = ACCEPTED)
@@ -252,7 +228,9 @@ pub fn send_dm_message(
 }
 
 /// Initializes a new UserAccount PDA with X25519 public key.
-pub fn init_user(accounts: &[AccountInfo], instruction_data: InitUserData) -> ProgramResult {
+#[inline(never)]
+#[cfg(feature = "bpf-entrypoint")]
+pub fn init_user(accounts: &[AccountInfo], instruction_data: Box<InitUserData>) -> ProgramResult {
     let signer = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let user_account_info = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let _system_program = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -290,22 +268,23 @@ pub fn init_user(accounts: &[AccountInfo], instruction_data: InitUserData) -> Pr
 
     // Initialize account data
     let user_account = UserAccount {
-        discriminator: 0,
+        discriminator: AccountDiscriminator::UserAccount,
         x25519_pubkey: instruction_data.x25519_pubkey,
         threads: Vec::new(),
     };
 
     // Serialize and write to account
     let mut data = user_account_info.try_borrow_mut_data()?;
-    user_account
-        .serialize(&mut &mut data[..])
+    UserAccount::serialize_into(&mut &mut data[..], &user_account)
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
     Ok(())
 }
 
 /// Adds a thread entry to the user's thread list.
-pub fn add_thread(accounts: &[AccountInfo], instruction_data: AddThreadData) -> ProgramResult {
+#[inline(never)]
+#[cfg(feature = "bpf-entrypoint")]
+pub fn add_thread(accounts: &[AccountInfo], instruction_data: Box<AddThreadData>) -> ProgramResult {
     let signer = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let user_account_info = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let _system_program = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -321,7 +300,7 @@ pub fn add_thread(accounts: &[AccountInfo], instruction_data: AddThreadData) -> 
     // Deserialize current account data (use deserialize to allow extra allocated space)
     let data = user_account_info.try_borrow_data()?;
     let mut user_account =
-        UserAccount::deserialize(&mut &data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
+        UserAccount::deserialize(&data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
     drop(data);
 
     // Check for duplicate thread
@@ -368,17 +347,18 @@ pub fn add_thread(accounts: &[AccountInfo], instruction_data: AddThreadData) -> 
 
     // Serialize and write updated data
     let mut data = user_account_info.try_borrow_mut_data()?;
-    user_account
-        .serialize(&mut &mut data[..])
+    UserAccount::serialize_into(&mut &mut data[..], &user_account)
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
     Ok(())
 }
 
 /// Accepts a pending thread (changes state from 0 to 1).
+#[inline(never)]
+#[cfg(feature = "bpf-entrypoint")]
 pub fn accept_thread(
     accounts: &[AccountInfo],
-    instruction_data: AcceptThreadData,
+    instruction_data: Box<AcceptThreadData>,
 ) -> ProgramResult {
     let signer = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let user_account_info = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -394,7 +374,7 @@ pub fn accept_thread(
     // Deserialize current account data (use deserialize to allow extra allocated space)
     let data = user_account_info.try_borrow_data()?;
     let mut user_account =
-        UserAccount::deserialize(&mut &data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
+        UserAccount::deserialize(&data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
     drop(data);
 
     // Find and update the thread
@@ -412,17 +392,18 @@ pub fn accept_thread(
 
     // Serialize and write updated data
     let mut data = user_account_info.try_borrow_mut_data()?;
-    user_account
-        .serialize(&mut &mut data[..])
+    UserAccount::serialize_into(&mut &mut data[..], &user_account)
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
     Ok(())
 }
 
 /// Removes a thread from the user's thread list.
+#[inline(never)]
+#[cfg(feature = "bpf-entrypoint")]
 pub fn remove_thread(
     accounts: &[AccountInfo],
-    instruction_data: RemoveThreadData,
+    instruction_data: Box<RemoveThreadData>,
 ) -> ProgramResult {
     let signer = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let user_account_info = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -438,7 +419,7 @@ pub fn remove_thread(
     // Deserialize current account data (use deserialize to allow extra allocated space)
     let data = user_account_info.try_borrow_data()?;
     let mut user_account =
-        UserAccount::deserialize(&mut &data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
+        UserAccount::deserialize(&data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
     drop(data);
 
     // Find and remove the thread
@@ -453,8 +434,7 @@ pub fn remove_thread(
 
     // Serialize and write updated data
     let mut data = user_account_info.try_borrow_mut_data()?;
-    user_account
-        .serialize(&mut &mut data[..])
+    UserAccount::serialize_into(&mut &mut data[..], &user_account)
         .map_err(|_| ProgramError::InvalidAccountData)?;
 
     Ok(())

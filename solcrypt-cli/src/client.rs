@@ -6,7 +6,6 @@
 //! - Querying compressed message accounts
 
 use anyhow::{Context, Result};
-use borsh::BorshDeserialize;
 use light_client::{
     indexer::{AddressWithTree, Indexer, ValidityProofWithContext},
     rpc::{LightClient, LightClientConfig, Rpc},
@@ -20,6 +19,7 @@ use solana_sdk::{
     transaction::Transaction,
 };
 use solcrypt_program::{MsgV1, ThreadEntry, UserAccount, THREAD_STATE_ACCEPTED, USER_SEED};
+use wincode::Deserialize as WincodeDeserialize;
 
 // ============================================================================
 // Custom Photon API types (with correct base58 encoding for memcmp)
@@ -159,7 +159,7 @@ impl SolcryptClient {
 
         match account {
             Some(acc) => {
-                let user_account = UserAccount::deserialize(&mut acc.data.as_slice())
+                let user_account = UserAccount::deserialize(acc.data.as_slice())
                     .context("Failed to deserialize UserAccount")?;
                 Ok(Some(user_account))
             }
@@ -275,7 +275,7 @@ impl SolcryptClient {
                     base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data.data)
                         .context("Failed to decode base64 account data")?;
 
-                if let Ok(msg) = MsgV1::deserialize(&mut bytes.as_slice()) {
+                if let Ok(msg) = MsgV1::deserialize(bytes.as_slice()) {
                     messages.push(msg);
                 }
             }
@@ -391,7 +391,7 @@ impl SolcryptClient {
                     )
                     .context("Failed to decode base64 account data")?;
 
-                    if let Ok(msg) = MsgV1::deserialize(&mut bytes.as_slice()) {
+                    if let Ok(msg) = MsgV1::deserialize(bytes.as_slice()) {
                         return Ok(Some(msg));
                     }
                 }

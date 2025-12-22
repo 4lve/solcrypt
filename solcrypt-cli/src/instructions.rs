@@ -25,6 +25,7 @@ use solcrypt_program::{
     AcceptThreadData, AddThreadData, InitUserData, InstructionType, RemoveThreadData,
     SendDmMessageData,
 };
+use wincode::Serialize;
 
 use crate::client::SolcryptClient;
 use crate::crypto::random_nonce;
@@ -40,10 +41,11 @@ pub fn build_init_user_instruction(
     let (user_pda, _bump) = SolcryptClient::get_user_pda(signer);
 
     let instruction_data = InitUserData {
-        discriminator: InstructionType::InitUser as u8,
+        discriminator: InstructionType::InitUser,
         x25519_pubkey,
     };
-    let data = borsh::to_vec(&instruction_data).context("Failed to serialize InitUserData")?;
+    let data =
+        InitUserData::serialize(&instruction_data).context("Failed to serialize InitUserData")?;
 
     let accounts = vec![
         AccountMeta::new(*signer, true),
@@ -66,10 +68,11 @@ pub fn build_accept_thread_instruction(
     let (user_pda, _bump) = SolcryptClient::get_user_pda(signer);
 
     let instruction_data = AcceptThreadData {
-        discriminator: InstructionType::AcceptThread as u8,
+        discriminator: InstructionType::AcceptThread,
         thread_id,
     };
-    let data = borsh::to_vec(&instruction_data).context("Failed to serialize AcceptThreadData")?;
+    let data = AcceptThreadData::serialize(&instruction_data)
+        .context("Failed to serialize AcceptThreadData")?;
 
     let accounts = vec![
         AccountMeta::new(*signer, true),
@@ -91,10 +94,11 @@ pub fn build_remove_thread_instruction(
     let (user_pda, _bump) = SolcryptClient::get_user_pda(signer);
 
     let instruction_data = RemoveThreadData {
-        discriminator: InstructionType::RemoveThread as u8,
+        discriminator: InstructionType::RemoveThread,
         thread_id,
     };
-    let data = borsh::to_vec(&instruction_data).context("Failed to serialize RemoveThreadData")?;
+    let data = RemoveThreadData::serialize(&instruction_data)
+        .context("Failed to serialize RemoveThreadData")?;
 
     let accounts = vec![
         AccountMeta::new(*signer, true),
@@ -117,11 +121,12 @@ pub fn build_add_thread_instruction(
     let (user_pda, _bump) = SolcryptClient::get_user_pda(signer);
 
     let instruction_data = AddThreadData {
-        discriminator: InstructionType::AddThread as u8,
+        discriminator: InstructionType::AddThread,
         thread_id,
         state,
     };
-    let data = borsh::to_vec(&instruction_data).context("Failed to serialize AddThreadData")?;
+    let data =
+        AddThreadData::serialize(&instruction_data).context("Failed to serialize AddThreadData")?;
 
     let accounts = vec![
         AccountMeta::new(*signer, true),
@@ -216,17 +221,18 @@ pub async fn build_send_dm_message_instruction(
 
     // Build instruction data
     let instruction_data = SendDmMessageData {
-        discriminator: InstructionType::SendDmMessage as u8,
+        discriminator: InstructionType::SendDmMessage,
         proof: rpc_result.value.proof.into(),
         address_tree_info: packed_address_tree_info.into(),
         output_state_tree_index: output_merkle_tree_index,
         thread_id,
-        recipient: recipient.to_bytes().into(),
+        recipient: recipient.to_bytes(),
         iv,
         ciphertext,
         nonce,
     };
-    let data = borsh::to_vec(&instruction_data).context("Failed to serialize SendDmMessageData")?;
+    let data = SendDmMessageData::serialize(&instruction_data)
+        .context("Failed to serialize SendDmMessageData")?;
 
     // Build account list:
     // [0] = signer (from light_accounts[0])

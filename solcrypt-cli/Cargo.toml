@@ -3,30 +3,35 @@ name = "solcrypt-cli"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Here to make rust-analyzer happy
+bpf-entrypoint = []
+test-sbf = []
+
 [dependencies]
 # Local program crate
 solcrypt = { path = "../program" }
 
 # Light Protocol
-light-client = "0.17.2"
-light-sdk = { version = "0.17.1", features = ["keccak"] }
+light-client.workspace = true
+light-sdk = { workspace = true, features = ["keccak", "wincode"] }
 
 # Solana
-solana-sdk = "2.3"
+solana-sdk.workspace = true
 
 # CLI
 clap = { version = "4", features = ["derive"] }
 
 # Async
-tokio = { version = "1", features = ["full"] }
+tokio.workspace = true
 
 # Serialization (match program's version for compatibility)
-borsh = "0.10.4"
+wincode.workspace = true
 
 # Crypto
-aes-gcm = "0.10"
-x25519-dalek = { version = "2", features = ["static_secrets"] }
-sha2 = "0.10"
+aes-gcm.workspace = true
+x25519-dalek.workspace = true
+sha2.workspace = true
 
 # Utils
 bs58 = "0.5"

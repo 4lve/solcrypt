@@ -4,7 +4,6 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
     aead::{Aead, OsRng, rand_core::RngCore},
 };
-use borsh::{BorshDeserialize, BorshSerialize};
 use light_program_test::{
     AddressWithTree, Indexer, ProgramTestConfig, Rpc, RpcError, program_test::LightProgramTest,
 };
@@ -19,9 +18,10 @@ use solana_sdk::{
 };
 use solana_system_interface::program::ID as SYSTEM_PROGRAM_ID;
 use solcrypt_program::{
-    AcceptThreadData, AddThreadData, InitUserData, InstructionType, MsgV1, RemoveThreadData,
-    SendDmMessageData, USER_SEED, UserAccount,
+    AcceptThreadData, AddThreadData, ClientSideMessage, InitUserData, InstructionType, MsgV1,
+    RemoveThreadData, SendDmMessageData, USER_SEED, UserAccount,
 };
+use wincode::{Deserialize, SchemaRead, SchemaWrite, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
 
 // ============================================================================
@@ -126,24 +126,6 @@ fn get_user_pda(user: &Pubkey, program_id: &Pubkey) -> (Pubkey, u8) {
 }
 
 // ============================================================================
-// Message Protocol (Client-side)
-// ============================================================================
-
-/// Message content enum - serialized before encryption.
-/// This is a client-side protocol; the program only sees opaque ciphertext bytes.
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq)]
-#[repr(u8)]
-pub enum Message {
-    /// Plain text message (UTF-8)
-    Text(String) = 0,
-    Image(String) = 10,
-    // Future variants:
-    // CompressedText { algo: u8, data: Vec<u8> },
-    // File { name: String, mime: String, data: Vec<u8> },
-    // Reaction { message_address: [u8; 32], emoji: String },
-}
-
-// ============================================================================
 // Main Test
 // ============================================================================
 
@@ -234,11 +216,12 @@ async fn test_solcrypt_dm() {
 
     // Compute thread ID using SHA256
     let thread_id = compute_thread_id(&payer.pubkey(), &recipient_keypair.pubkey());
-    let nonce = random_nonce();
+    // First message in a thread has a nonce of 0
+    let nonce = [0u8; 32];
 
     // Create and serialize the message
-    let message = Message::Text("Hello from Solcrypt! This is an E2EE message.".into());
-    let plaintext = message.try_to_vec().unwrap();
+    let message = ClientSideMessage::Text("Hello from Solcrypt! This is an E2EE message.".into());
+    let plaintext = ClientSideMessage::serialize(&message).unwrap();
 
     // Encrypt the serialized message
     let (iv, ciphertext) = encrypt_message(&sender_aes_key, &plaintext);
@@ -291,7 +274,8 @@ async fn test_solcrypt_dm() {
 
     // Decrypt and deserialize the message content
     let decrypted_bytes = decrypt_message(&recipient_aes_key, &msg.iv, &msg.ciphertext);
-    let decrypted_message = Message::deserialize(&mut decrypted_bytes.as_slice()).unwrap();
+    let decrypted_message =
+        ClientSideMessage::deserialize(&mut decrypted_bytes.as_slice()).unwrap();
     assert_eq!(decrypted_message, message);
     println!("  ✓ Message encrypted and stored on-chain");
     println!("  ✓ Recipient decrypted: {:?}", decrypted_message);
@@ -410,10 +394,10 @@ pub async fn init_user(
     let (user_pda, _bump) = get_user_pda(&user.pubkey(), &program_id);
 
     let instruction_data = InitUserData {
-        discriminator: InstructionType::InitUser as u8,
+        discriminator: InstructionType::InitUser,
         x25519_pubkey,
     };
-    let inputs = instruction_data.try_to_vec().unwrap();
+    let inputs = InitUserData::serialize(&instruction_data).unwrap();
 
     let accounts = vec![
         AccountMeta::new(user.pubkey(), true),
@@ -443,10 +427,10 @@ pub async fn accept_thread_for(
     let (user_pda, _bump) = get_user_pda(&user.pubkey(), &program_id);
 
     let instruction_data = AcceptThreadData {
-        discriminator: InstructionType::AcceptThread as u8,
+        discriminator: InstructionType::AcceptThread,
         thread_id,
     };
-    let inputs = instruction_data.try_to_vec().unwrap();
+    let inputs = AcceptThreadData::serialize(&instruction_data).unwrap();
 
     let accounts = vec![
         AccountMeta::new(user.pubkey(), true),
@@ -523,7 +507,7 @@ pub async fn send_dm_message(
     accounts.extend(light_accounts[1..].iter().cloned());
 
     let instruction_data = SendDmMessageData {
-        discriminator: InstructionType::SendDmMessage as u8,
+        discriminator: InstructionType::SendDmMessage,
         proof: rpc_result.proof.into(),
         address_tree_info: packed_address_tree_info.into(),
         output_state_tree_index: output_merkle_tree_index,
@@ -533,7 +517,7 @@ pub async fn send_dm_message(
         ciphertext,
         nonce,
     };
-    let inputs = instruction_data.try_to_vec().unwrap();
+    let inputs = SendDmMessageData::serialize(&instruction_data).unwrap();
 
     let instruction = Instruction {
         program_id,
@@ -557,11 +541,11 @@ pub async fn add_thread(
     let (user_pda, _bump) = get_user_pda(&payer.pubkey(), &program_id);
 
     let instruction_data = AddThreadData {
-        discriminator: InstructionType::AddThread as u8,
+        discriminator: InstructionType::AddThread,
         thread_id,
         state,
     };
-    let inputs = instruction_data.try_to_vec().unwrap();
+    let inputs = AddThreadData::serialize(&instruction_data).unwrap();
 
     let accounts = vec![
         AccountMeta::new(payer.pubkey(), true),
@@ -590,10 +574,10 @@ pub async fn accept_thread(
     let (user_pda, _bump) = get_user_pda(&payer.pubkey(), &program_id);
 
     let instruction_data = AcceptThreadData {
-        discriminator: InstructionType::AcceptThread as u8,
+        discriminator: InstructionType::AcceptThread,
         thread_id,
     };
-    let inputs = instruction_data.try_to_vec().unwrap();
+    let inputs = AcceptThreadData::serialize(&instruction_data).unwrap();
 
     let accounts = vec![
         AccountMeta::new(payer.pubkey(), true),
@@ -621,10 +605,10 @@ pub async fn remove_thread(
     let (user_pda, _bump) = get_user_pda(&payer.pubkey(), &program_id);
 
     let instruction_data = RemoveThreadData {
-        discriminator: InstructionType::RemoveThread as u8,
+        discriminator: InstructionType::RemoveThread,
         thread_id,
     };
-    let inputs = instruction_data.try_to_vec().unwrap();
+    let inputs = RemoveThreadData::serialize(&instruction_data).unwrap();
 
     let accounts = vec![
         AccountMeta::new(payer.pubkey(), true),

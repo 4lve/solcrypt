@@ -1,7 +1,7 @@
-use borsh::{BorshDeserialize, BorshSerialize};
-use codama::CodamaInstruction;
+use codama::{CodamaInstruction, CodamaType};
 use light_sdk_pinocchio::error::LightSdkError;
 use pinocchio::pubkey::Pubkey;
+use wincode::{SchemaRead, SchemaWrite};
 
 use crate::types::{PackedAddressTreeInfoCodama, ValidityProofCodama};
 
@@ -9,8 +9,11 @@ use crate::types::{PackedAddressTreeInfoCodama, ValidityProofCodama};
 // Instruction Types
 // ============================================================================
 
+#[derive(Debug, Clone, SchemaWrite, SchemaRead, CodamaType, Default)]
+#[wincode(tag_encoding = "u8")]
 #[repr(u8)]
 pub enum InstructionType {
+    #[default]
     SendDmMessage = 0,
     InitUser = 1,
     AddThread = 2,
@@ -38,7 +41,7 @@ impl TryFrom<u8> for InstructionType {
 // ============================================================================
 
 /// Instruction data for sending a DM message (creates compressed MsgV1 leaf)
-#[derive(BorshSerialize, BorshDeserialize, CodamaInstruction)]
+#[derive(SchemaWrite, SchemaRead, CodamaInstruction)]
 #[codama(discriminator(field = "discriminator"))]
 #[codama(account(name = "signer", signer, writable))]
 #[codama(account(name = "sender_user_account", writable, default_value = pda(
@@ -56,7 +59,7 @@ impl TryFrom<u8> for InstructionType {
 #[codama(account(name = "system_program"))]
 pub struct SendDmMessageData {
     #[codama(default_value = 0)]
-    pub discriminator: u8,
+    pub discriminator: InstructionType,
     /// ZK validity proof
     pub proof: ValidityProofCodama,
     /// Address tree info for the new message
@@ -77,7 +80,7 @@ pub struct SendDmMessageData {
 }
 
 /// Instruction data for initializing a user account PDA
-#[derive(BorshSerialize, BorshDeserialize, CodamaInstruction)]
+#[derive(SchemaWrite, SchemaRead, CodamaInstruction)]
 #[codama(discriminator(field = "discriminator"))]
 #[codama(account(name = "signer", signer, writable))]
 #[codama(account(name = "user_account", writable, default_value = pda(
@@ -89,13 +92,13 @@ pub struct SendDmMessageData {
 #[codama(account(name = "system_program"))]
 pub struct InitUserData {
     #[codama(default_value = 1)]
-    pub discriminator: u8,
+    pub discriminator: InstructionType,
     /// X25519 public key for E2EE key derivation
     pub x25519_pubkey: [u8; 32],
 }
 
 /// Instruction data for adding a thread to user's thread list
-#[derive(BorshSerialize, BorshDeserialize, CodamaInstruction)]
+#[derive(SchemaWrite, SchemaRead, CodamaInstruction)]
 #[codama(discriminator(field = "discriminator"))]
 #[codama(account(name = "signer", signer))]
 #[codama(account(name = "user_account", writable, default_value = pda(
@@ -107,7 +110,7 @@ pub struct InitUserData {
 #[codama(account(name = "system_program"))]
 pub struct AddThreadData {
     #[codama(default_value = 2)]
-    pub discriminator: u8,
+    pub discriminator: InstructionType,
     /// Thread ID to add
     pub thread_id: [u8; 32],
     /// Initial state (0 = pending, 1 = accepted)
@@ -115,7 +118,7 @@ pub struct AddThreadData {
 }
 
 /// Instruction data for accepting a pending thread
-#[derive(BorshSerialize, BorshDeserialize, CodamaInstruction)]
+#[derive(SchemaWrite, SchemaRead, CodamaInstruction)]
 #[codama(discriminator(field = "discriminator"))]
 #[codama(account(name = "signer", signer))]
 #[codama(account(name = "user_account", writable, default_value = pda(
@@ -126,13 +129,13 @@ pub struct AddThreadData {
 )))]
 pub struct AcceptThreadData {
     #[codama(default_value = 3)]
-    pub discriminator: u8,
+    pub discriminator: InstructionType,
     /// Thread ID to accept
     pub thread_id: [u8; 32],
 }
 
 /// Instruction data for removing a thread from user's thread list
-#[derive(BorshSerialize, BorshDeserialize, CodamaInstruction)]
+#[derive(SchemaWrite, SchemaRead, CodamaInstruction)]
 #[codama(discriminator(field = "discriminator"))]
 #[codama(account(name = "signer", signer))]
 #[codama(account(name = "user_account", writable, default_value = pda(
@@ -143,7 +146,7 @@ pub struct AcceptThreadData {
 )))]
 pub struct RemoveThreadData {
     #[codama(default_value = 4)]
-    pub discriminator: u8,
+    pub discriminator: InstructionType,
     /// Thread ID to remove
     pub thread_id: [u8; 32],
 }

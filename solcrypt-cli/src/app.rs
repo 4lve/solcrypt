@@ -1,9 +1,9 @@
 //! Application state and screen management for the TUI.
 
 use solana_sdk::pubkey::Pubkey;
-use solcrypt_program::MsgV1;
+use solcrypt_program::{ClientSideMessage, MsgV1};
 
-use crate::crypto::Message;
+use crate::crypto::ClientSideMessageExt;
 
 /// The current screen/view in the application
 #[derive(Debug, Clone, PartialEq)]
@@ -221,7 +221,7 @@ impl App {
                 let sender = Pubkey::from(msg.sender);
                 let is_me = sender == self.user_pubkey;
 
-                let content = Message::decrypt(aes_key, &msg.iv, &msg.ciphertext)
+                let content = ClientSideMessage::decrypt(aes_key, &msg.iv, &msg.ciphertext)
                     .map(|m| m.display_text().to_string())
                     .unwrap_or_else(|_| "<decryption failed>".to_string());
 

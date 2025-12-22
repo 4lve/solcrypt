@@ -1,6 +1,6 @@
 {
     "rust-analyzer.cargo.features": [
-        //"test-sbf"
+        "test-sbf",
         "bpf-entrypoint"
     ],
     "rust-analyzer.cargo.buildScripts.enable": true,

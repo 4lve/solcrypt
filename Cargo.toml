@@ -4,3 +4,25 @@ resolver = "2"
 
 [workspace.dependencies]
 codama = "0.7.1"
+
+# Shared crypto dependencies
+wincode = { version = "0.2.5", features = ["derive"] }
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+
+# Shared Solana dependencies
+solana-sdk = "2.3"
+
+# Shared async runtime
+tokio = { version = "1.43.0", features = ["full"] }
+
+# Light Protocol dependencies
+light-client = { git = "https://github.com/4lve/light-protocol.git", branch = "main" }
+light-sdk = { git = "https://github.com/4lve/light-protocol.git", branch = "main" }
+light-sdk-pinocchio = { git = "https://github.com/4lve/light-protocol.git", branch = "main" }
+light-sdk-types = { git = "https://github.com/4lve/light-protocol.git", branch = "main" }
+light-hasher = { git = "https://github.com/4lve/light-protocol.git", branch = "main" }
+light-macros = { git = "https://github.com/4lve/light-protocol.git", branch = "main" }
+light-program-test = { git = "https://github.com/4lve/light-protocol.git", branch = "main" }
+light-compressed-account = { git = "https://github.com/4lve/light-protocol.git", branch = "main" }

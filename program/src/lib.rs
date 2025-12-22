@@ -17,10 +17,12 @@ pub use types::*;
 
 #[cfg(feature = "bpf-entrypoint")]
 mod entrypoint {
-    use borsh::BorshDeserialize;
+    use core::mem::MaybeUninit;
+
     use pinocchio::{
         ProgramResult, account_info::AccountInfo, entrypoint, program_error::ProgramError,
     };
+    use wincode::Deserialize;
 
     use crate::instruction::AcceptThreadData;
     use crate::instruction::AddThreadData;
@@ -31,6 +33,20 @@ mod entrypoint {
     use crate::processor;
 
     entrypoint!(process_instruction);
+
+    /// Deserialize directly into heap memory, avoiding stack allocation of large structs.
+    ///
+    /// # Safety
+    /// Safe because `deserialize_into` fully initializes the memory before we call `assume_init`.
+    #[inline(never)]
+    fn deserialize_to_heap<'a, T: Deserialize<'a, Dst = T>>(
+        data: &'a [u8],
+    ) -> Result<Box<T>, ProgramError> {
+        let mut boxed = Box::new(MaybeUninit::<T>::uninit());
+        T::deserialize_into(data, &mut *boxed).map_err(|_| ProgramError::InvalidInstructionData)?;
+        // SAFETY: deserialize_into succeeded, so memory is fully initialized
+        Ok(unsafe { boxed.assume_init() })
+    }
 
     // ============================================================================
     // Entrypoint & Instruction Routing
@@ -53,28 +69,23 @@ mod entrypoint {
 
         match discriminator {
             InstructionType::SendDmMessage => {
-                let ix_data = SendDmMessageData::try_from_slice(&instruction_data[..])
-                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let ix_data = deserialize_to_heap::<SendDmMessageData>(instruction_data)?;
                 processor::send_dm_message(accounts, ix_data)
             }
             InstructionType::InitUser => {
-                let ix_data = InitUserData::try_from_slice(&instruction_data[..])
-                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let ix_data = deserialize_to_heap::<InitUserData>(instruction_data)?;
                 processor::init_user(accounts, ix_data)
             }
             InstructionType::AddThread => {
-                let ix_data = AddThreadData::try_from_slice(&instruction_data[..])
-                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let ix_data = deserialize_to_heap::<AddThreadData>(instruction_data)?;
                 processor::add_thread(accounts, ix_data)
             }
             InstructionType::AcceptThread => {
-                let ix_data = AcceptThreadData::try_from_slice(&instruction_data[..])
-                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let ix_data = deserialize_to_heap::<AcceptThreadData>(instruction_data)?;
                 processor::accept_thread(accounts, ix_data)
             }
             InstructionType::RemoveThread => {
-                let ix_data = RemoveThreadData::try_from_slice(&instruction_data[..])
-                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                let ix_data = deserialize_to_heap::<RemoveThreadData>(instruction_data)?;
                 processor::remove_thread(accounts, ix_data)
             }
         }

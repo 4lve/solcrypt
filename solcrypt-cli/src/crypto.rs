@@ -11,9 +11,10 @@ use aes_gcm::{
     Aes256Gcm, KeyInit, Nonce,
 };
 use anyhow::{Context, Result};
-use borsh::{BorshDeserialize, BorshSerialize};
 use sha2::{Digest, Sha256};
 use solana_sdk::{pubkey::Pubkey, signature::Keypair, signer::Signer};
+use solcrypt_program::ClientSideMessage;
+use wincode::{Deserialize, Serialize};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519SecretKey};
 
 /// Derives an X25519 keypair from a Solana keypair.
@@ -114,40 +115,38 @@ pub fn random_nonce() -> [u8; 32] {
     nonce
 }
 
-/// Message content enum - serialized before encryption.
-/// This is a client-side protocol; the program only sees opaque ciphertext bytes.
-#[derive(Debug, Clone, BorshSerialize, BorshDeserialize, PartialEq)]
-#[repr(u8)]
-pub enum Message {
-    /// Plain text message (UTF-8)
-    Text(String) = 0,
-    /// Image URL
-    Image(String) = 10,
+pub trait ClientSideMessageExt {
+    fn text(content: impl Into<String>) -> Self;
+    fn encrypt(&self, aes_key: &[u8; 32]) -> Result<([u8; 12], Vec<u8>)>;
+    fn decrypt(aes_key: &[u8; 32], iv: &[u8; 12], ciphertext: &[u8]) -> Result<ClientSideMessage>;
+    fn display_text(&self) -> &str;
 }
 
-impl Message {
+impl ClientSideMessageExt for ClientSideMessage {
     /// Create a text message
-    pub fn text(content: impl Into<String>) -> Self {
-        Message::Text(content.into())
+    fn text(content: impl Into<String>) -> Self {
+        ClientSideMessage::Text(content.into())
     }
 
     /// Serialize and encrypt the message
-    pub fn encrypt(&self, aes_key: &[u8; 32]) -> Result<([u8; 12], Vec<u8>)> {
-        let plaintext = borsh::to_vec(self).context("Failed to serialize message")?;
+    fn encrypt(&self, aes_key: &[u8; 32]) -> Result<([u8; 12], Vec<u8>)> {
+        let plaintext =
+            ClientSideMessage::serialize(self).context("Failed to serialize message")?;
         encrypt_message(aes_key, &plaintext)
     }
 
     /// Decrypt and deserialize a message
-    pub fn decrypt(aes_key: &[u8; 32], iv: &[u8; 12], ciphertext: &[u8]) -> Result<Self> {
+    fn decrypt(aes_key: &[u8; 32], iv: &[u8; 12], ciphertext: &[u8]) -> Result<Self> {
         let plaintext = decrypt_message(aes_key, iv, ciphertext)?;
-        Message::try_from_slice(&plaintext).context("Failed to deserialize message")
+        ClientSideMessage::deserialize(plaintext.as_slice())
+            .context("Failed to deserialize message")
     }
 
     /// Get the display text for this message
-    pub fn display_text(&self) -> &str {
+    fn display_text(&self) -> &str {
         match self {
-            Message::Text(s) => s,
-            Message::Image(url) => url,
+            ClientSideMessage::Text(s) => s,
+            ClientSideMessage::Image(url) => url,
         }
     }
 }
@@ -170,10 +169,10 @@ mod tests {
     #[test]
     fn test_encrypt_decrypt_roundtrip() {
         let key = [42u8; 32];
-        let message = Message::text("Hello, World!");
+        let message = ClientSideMessage::text("Hello, World!");
 
         let (iv, ciphertext) = message.encrypt(&key).unwrap();
-        let decrypted = Message::decrypt(&key, &iv, &ciphertext).unwrap();
+        let decrypted = ClientSideMessage::decrypt(&key, &iv, &ciphertext).unwrap();
 
         assert_eq!(message, decrypted);
     }
