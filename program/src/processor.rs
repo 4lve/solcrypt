@@ -1,9 +1,33 @@
-use pinocchio::{
-    program_error::ProgramError,
-    pubkey::Pubkey,
+use crate::{
+    constants::{
+        ID, INITIAL_THREAD_CAPACITY, LIGHT_CPI_SIGNER, THREAD_STATE_ACCEPTED, THREAD_STATE_PENDING,
+        USER_SEED,
+    },
+    error::SolcryptError,
+    instruction::{
+        AcceptThreadData, AddThreadData, InitUserData, RemoveThreadData, SendDmMessageData,
+    },
+    state::{MsgV1, ThreadEntry, UserAccount},
 };
-
-use crate::constants::USER_SEED;
+use light_sdk_pinocchio::{
+    LightAccount,
+    address::v1::derive_address,
+    cpi::{
+        CpiAccountsConfig, InvokeLightSystemProgram, LightCpiInstruction,
+        v1::{CpiAccounts, LightSystemProgramCpi},
+    },
+    instruction::PackedAddressTreeInfo,
+};
+use pinocchio::{
+    ProgramResult,
+    account_info::AccountInfo,
+    instruction::Signer,
+    seeds,
+    sysvars::{Sysvar, clock::Clock},
+};
+use pinocchio::{program_error::ProgramError, pubkey::Pubkey};
+use pinocchio_system::instructions::{CreateAccount, Transfer};
+use wincode::{Deserialize, Serialize};
 
 // ============================================================================
 // Helper Functions
@@ -34,6 +58,7 @@ fn add_thread_to_user_account(
     state: u8,
 ) -> ProgramResult {
     // Deserialize current account data
+
     let data = user_pda.try_borrow_data()?;
     let mut user_account =
         UserAccount::deserialize(&data[..]).map_err(|_| ProgramError::InvalidAccountData)?;
@@ -231,6 +256,8 @@ pub fn send_dm_message(
 #[inline(never)]
 #[cfg(feature = "bpf-entrypoint")]
 pub fn init_user(accounts: &[AccountInfo], instruction_data: Box<InitUserData>) -> ProgramResult {
+    use crate::AccountDiscriminator;
+
     let signer = accounts.first().ok_or(ProgramError::NotEnoughAccountKeys)?;
     let user_account_info = accounts.get(1).ok_or(ProgramError::NotEnoughAccountKeys)?;
     let _system_program = accounts.get(2).ok_or(ProgramError::NotEnoughAccountKeys)?;
