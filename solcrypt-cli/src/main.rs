@@ -127,21 +127,33 @@ async fn run_app(
                     }
                     EventResult::OpenChat => {
                         if let Some(chat) = app.get_selected_chat() {
-                            if !chat.is_accepted {
-                                app.set_status("Accept this chat first with 'a'");
-                            } else {
-                                let recipient = chat.other_party;
-                                app.navigate_to(Screen::Chat { recipient });
-                                load_messages(app, client, x25519_secret, &recipient).await?;
-                            }
+                            let recipient = chat.other_party;
+                            app.navigate_to(Screen::Chat { recipient });
+                            load_messages(app, client, x25519_secret, &recipient).await?;
                         }
                     }
                     EventResult::SendMessage(content) => {
                         if let Screen::Chat { recipient } = &app.screen {
                             let recipient = *recipient;
-                            send_message(app, client, x25519_secret, &recipient, &content).await?;
-                            // Reload messages
-                            load_messages(app, client, x25519_secret, &recipient).await?;
+
+                            // Show sending popup
+                            app.sending_message = true;
+                            terminal.draw(|f| ui::render(f, app))?;
+
+                            // Send message
+                            let result =
+                                send_message(app, client, x25519_secret, &recipient, &content)
+                                    .await;
+
+                            // Hide sending popup
+                            app.sending_message = false;
+
+                            if let Err(e) = result {
+                                app.set_status(format!("Failed to send: {}", e));
+                            } else {
+                                // Reload messages
+                                load_messages(app, client, x25519_secret, &recipient).await?;
+                            }
                         }
                     }
                     EventResult::StartNewChat(recipient_str) => {
@@ -201,7 +213,15 @@ async fn run_app(
                     EventResult::LoadMessages => {
                         if let Screen::Chat { recipient } = &app.screen {
                             let recipient = *recipient;
+
+                            // Show refreshing popup
+                            app.refreshing = true;
+                            terminal.draw(|f| ui::render(f, app))?;
+
                             load_messages(app, client, x25519_secret, &recipient).await?;
+
+                            // Hide refreshing popup
+                            app.refreshing = false;
                         }
                     }
                 }

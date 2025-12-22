@@ -82,6 +82,12 @@ pub struct App {
 
     /// User's public key
     pub user_pubkey: Pubkey,
+
+    /// Whether a message is currently being sent (for overlay popup)
+    pub sending_message: bool,
+
+    /// Whether messages are being refreshed (for overlay popup)
+    pub refreshing: bool,
 }
 
 impl App {
@@ -102,6 +108,8 @@ impl App {
             message_scroll: 0,
             status: None,
             user_pubkey,
+            sending_message: false,
+            refreshing: false,
         }
     }
 

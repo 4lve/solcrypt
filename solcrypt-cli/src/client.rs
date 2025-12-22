@@ -7,7 +7,10 @@
 
 use anyhow::{Context, Result};
 use light_client::{
-    indexer::{AddressWithTree, Indexer, ValidityProofWithContext},
+    indexer::{
+        AddressWithTree, GetCompressedAccountsByOwnerConfig, GetCompressedAccountsFilter, Indexer,
+        ValidityProofWithContext,
+    },
     rpc::{LightClient, LightClientConfig, Rpc},
 };
 use light_sdk::address::v1::derive_address;
@@ -216,86 +219,33 @@ impl SolcryptClient {
         Ok(result.value)
     }
 
-    /// Custom getCompressedAccountsByOwner with proper base58 memcmp encoding
-    /// (light-client uses base64 which is wrong per Photon API spec)
-    async fn get_compressed_accounts_by_owner_custom(
-        &self,
-        owner: &Pubkey,
-        thread_id_filter: Option<[u8; 32]>,
-        limit: Option<u16>,
-    ) -> Result<Vec<MsgV1>> {
-        let filters = thread_id_filter.map(|tid| {
-            vec![PhotonFilterSelector {
-                memcmp: PhotonMemcmp {
-                    offset: 0, // thread_id is the first field
-                    bytes: bs58::encode(&tid).into_string(),
-                },
-            }]
-        });
-
-        let params = GetCompressedAccountsByOwnerParams {
-            owner: owner.to_string(),
-            filters,
-            limit,
-            cursor: None,
-        };
-
-        let request = PhotonRequest {
-            jsonrpc: "2.0",
-            id: "1",
-            method: "getCompressedAccountsByOwner",
-            params,
-        };
-
-        let response = self
-            .http_client
-            .post(&self.rpc_url)
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send request to Photon API")?;
-
-        let result: PhotonResponse<PhotonAccountsResult> = response
-            .json()
-            .await
-            .context("Failed to parse Photon API response")?;
-
-        if let Some(error) = result.error {
-            anyhow::bail!("Photon API error {}: {}", error.code, error.message);
-        }
-
-        let accounts = result.result.context("No result in Photon API response")?;
-
-        let mut messages: Vec<MsgV1> = Vec::new();
-
-        for account in accounts.value.items {
-            if let Some(data) = account.data {
-                // Decode base64 data
-                let bytes =
-                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &data.data)
-                        .context("Failed to decode base64 account data")?;
-
-                if let Ok(msg) = MsgV1::deserialize(bytes.as_slice()) {
-                    messages.push(msg);
-                }
-            }
-        }
-
-        Ok(messages)
-    }
-
     /// Fetch compressed messages for a thread
     /// Returns messages sorted by timestamp (oldest first)
     pub async fn get_messages_for_thread(&self, thread_id: [u8; 32]) -> Result<Vec<MsgV1>> {
-        let mut messages = self
-            .get_compressed_accounts_by_owner_custom(
+        let messages = self
+            .rpc
+            .get_compressed_accounts_by_owner(
                 &solcrypt_program::ID.into(),
-                Some(thread_id),
+                Some(GetCompressedAccountsByOwnerConfig {
+                    filters: Some(vec![GetCompressedAccountsFilter {
+                        bytes: thread_id.to_vec(),
+                        offset: 1,
+                    }]),
+                    data_slice: None,
+                    cursor: None,
+                    limit: None,
+                }),
                 None, // Get all messages for the thread
             )
             .await?;
 
-        // Sort by timestamp (oldest first)
+        let mut messages: Vec<MsgV1> = messages
+            .value
+            .items
+            .iter()
+            .map(|acc| MsgV1::deserialize(&acc.data.as_ref().unwrap().data.as_slice()).unwrap())
+            .collect();
+
         messages.sort_by_key(|m| m.unix_timestamp);
 
         Ok(messages)
@@ -328,10 +278,14 @@ impl SolcryptClient {
 
         // Try to fetch the first message directly by its derived address
         match self
-            .get_compressed_account_by_address(&first_msg_address)
+            .rpc
+            .get_compressed_account(first_msg_address, None)
             .await?
+            .value
         {
-            Some(msg) => {
+            Some(account) => {
+                let msg =
+                    MsgV1::deserialize(&account.data.as_ref().unwrap().data.as_slice()).unwrap();
                 let sender = Pubkey::from(msg.sender);
                 let recipient = Pubkey::from(msg.recipient);
 
@@ -343,61 +297,6 @@ impl SolcryptClient {
                 }
             }
             None => Ok(None),
-        }
-    }
-
-    /// Get a compressed account by its specific address (O(1) lookup)
-    async fn get_compressed_account_by_address(&self, address: &[u8; 32]) -> Result<Option<MsgV1>> {
-        // Photon API: getCompressedAccount
-        #[derive(Debug, Serialize)]
-        struct GetCompressedAccountParams {
-            address: String, // Base58 encoded address
-        }
-
-        let params = GetCompressedAccountParams {
-            address: bs58::encode(address).into_string(),
-        };
-
-        let request = PhotonRequest {
-            jsonrpc: "2.0",
-            id: "1",
-            method: "getCompressedAccount",
-            params,
-        };
-
-        let response = self
-            .http_client
-            .post(&self.rpc_url)
-            .json(&request)
-            .send()
-            .await
-            .context("Failed to send request to Photon API")?;
-
-        let result: PhotonResponse<Option<PhotonAccount>> = response
-            .json()
-            .await
-            .context("Failed to parse Photon API response")?;
-
-        if let Some(error) = result.error {
-            anyhow::bail!("Photon API error {}: {}", error.code, error.message);
-        }
-
-        match result.result {
-            Some(Some(account)) => {
-                if let Some(data) = account.data {
-                    let bytes = base64::Engine::decode(
-                        &base64::engine::general_purpose::STANDARD,
-                        &data.data,
-                    )
-                    .context("Failed to decode base64 account data")?;
-
-                    if let Ok(msg) = MsgV1::deserialize(bytes.as_slice()) {
-                        return Ok(Some(msg));
-                    }
-                }
-                Ok(None)
-            }
-            _ => Ok(None),
         }
     }
 

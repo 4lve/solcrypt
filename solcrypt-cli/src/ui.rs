@@ -218,6 +218,61 @@ fn render_chat(frame: &mut Frame, app: &App, recipient: &solana_sdk::pubkey::Pub
     let help =
         Paragraph::new(format!(" {}", help_text)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(help, chunks[3]);
+
+    // Popup overlays
+    if app.sending_message {
+        render_sending_popup(frame);
+    } else if app.refreshing {
+        render_refreshing_popup(frame);
+    }
+}
+
+/// Render sending message popup overlay
+fn render_sending_popup(frame: &mut Frame) {
+    let area = centered_rect(35, 15, frame.area());
+    frame.render_widget(Clear, area);
+
+    let popup = Paragraph::new(Text::from(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Sending message...  ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" Sending "),
+    );
+    frame.render_widget(popup, area);
+}
+
+/// Render refreshing popup overlay
+fn render_refreshing_popup(frame: &mut Frame) {
+    let area = centered_rect(35, 15, frame.area());
+    frame.render_widget(Clear, area);
+
+    let popup = Paragraph::new(Text::from(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Refreshing...  ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ]))
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Refresh "),
+    );
+    frame.render_widget(popup, area);
 }
 
 /// Render the new chat dialog
