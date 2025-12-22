@@ -27,6 +27,18 @@ pub enum Screen {
     NewGroup,
     /// Invite member to group dialog
     InviteMember { group_id: [u8; 32] },
+    /// Remove member from group - shows member list
+    RemoveMember {
+        group_id: [u8; 32],
+        members: Vec<GroupMemberInfo>,
+        selected: usize,
+    },
+    /// Set member role dialog - shows member list
+    SetMemberRole {
+        group_id: [u8; 32],
+        members: Vec<GroupMemberInfo>,
+        selected: usize,
+    },
     /// Loading screen while performing async operations
     Loading { message: String },
     /// Error screen
@@ -57,6 +69,14 @@ pub struct GroupThread {
     pub unread: bool,
     /// Number of members (if known)
     pub member_count: Option<usize>,
+}
+
+/// Group member info for display in member lists
+#[derive(Debug, Clone, PartialEq)]
+pub struct GroupMemberInfo {
+    pub pubkey: Pubkey,
+    pub role: u8,
+    pub role_name: String,
 }
 
 /// A message for display
@@ -354,17 +374,37 @@ impl App {
         }
     }
 
-    /// Update group messages from GroupMsgV1 list
+    /// Update group messages from GroupMsgV1 list (single key - for compatibility)
+    #[allow(dead_code)]
     pub fn update_group_messages(&mut self, msgs: Vec<GroupMsgV1>, aes_key: &[u8; 32]) {
+        // Convert to single-key map and delegate
+        let mut keys = std::collections::HashMap::new();
+        // Use version 0 as fallback for all messages
+        keys.insert(0u32, *aes_key);
+        self.update_group_messages_with_keys(msgs, &keys);
+    }
+
+    /// Update group messages from GroupMsgV1 list with version-aware decryption
+    pub fn update_group_messages_with_keys(
+        &mut self,
+        msgs: Vec<GroupMsgV1>,
+        keys: &std::collections::HashMap<u32, [u8; 32]>,
+    ) {
         self.group_messages = msgs
             .into_iter()
             .map(|msg| {
                 let sender = Pubkey::from(msg.sender);
                 let is_me = sender == self.user_pubkey;
 
-                let content = ClientSideMessage::decrypt(aes_key, &msg.iv, &msg.ciphertext)
-                    .map(|m| m.display_text().to_string())
-                    .unwrap_or_else(|_| "<decryption failed>".to_string());
+                // Get the key for this message's version
+                let content = keys
+                    .get(&msg.key_version)
+                    .and_then(|key| {
+                        ClientSideMessage::decrypt(key, &msg.iv, &msg.ciphertext)
+                            .map(|m| m.display_text().to_string())
+                            .ok()
+                    })
+                    .unwrap_or_else(|| format!("<key v{} unavailable>", msg.key_version));
 
                 let timestamp_str = chrono::DateTime::from_timestamp(msg.unix_timestamp, 0)
                     .map(|dt| dt.format("%H:%M").to_string())

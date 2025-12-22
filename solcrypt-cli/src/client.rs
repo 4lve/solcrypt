@@ -255,6 +255,91 @@ impl SolcryptClient {
         }
     }
 
+    /// Get my GroupKeyV1 for a group at a specific key version
+    pub async fn get_my_group_key_at_version(
+        &self,
+        group_id: &[u8; 32],
+        key_version: u32,
+    ) -> Result<Option<(GroupKeyV1, [u8; 32])>> {
+        let address_tree_info = self.rpc.get_address_tree_v1();
+        let key_version_bytes = key_version.to_le_bytes();
+
+        let (key_address, _) = derive_address(
+            &[
+                GROUP_KEY_SEED,
+                group_id,
+                self.payer.pubkey().as_ref(),
+                &key_version_bytes,
+            ],
+            &address_tree_info.tree,
+            &solcrypt_program::ID.into(),
+        );
+
+        match self
+            .rpc
+            .get_compressed_account(key_address, None)
+            .await?
+            .value
+        {
+            Some(account) => {
+                let group_key =
+                    GroupKeyV1::deserialize(&account.data.as_ref().unwrap().data.as_slice())
+                        .context("Failed to deserialize GroupKeyV1")?;
+
+                Ok(Some((group_key, key_address)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get all my GroupKeyV1 accounts for a group (all versions I have access to)
+    /// Returns a map of key_version -> decrypted AES key
+    pub async fn get_my_group_keys_all_versions(
+        &self,
+        group_id: &[u8; 32],
+    ) -> Result<std::collections::HashMap<u32, GroupKeyV1>> {
+        use solcrypt_program::AccountDiscriminator;
+
+        // Build filter: discriminator + group_id + member
+        let discriminator_byte = AccountDiscriminator::GroupKeyV1 as u8;
+        let mut filter_bytes = vec![discriminator_byte];
+        filter_bytes.extend_from_slice(group_id);
+        filter_bytes.extend_from_slice(self.payer.pubkey().as_ref());
+
+        // Query all GroupKeyV1 accounts for this group and member
+        let accounts = self
+            .rpc
+            .get_compressed_accounts_by_owner(
+                &solcrypt_program::ID.into(),
+                Some(GetCompressedAccountsByOwnerConfig {
+                    filters: Some(vec![GetCompressedAccountsFilter {
+                        bytes: filter_bytes,
+                        offset: 0,
+                    }]),
+                    data_slice: None,
+                    cursor: None,
+                    limit: None,
+                }),
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get group keys: {:?}", e))?
+            .value
+            .items;
+
+        let mut keys = std::collections::HashMap::new();
+
+        for account in accounts {
+            if let Some(data) = &account.data {
+                if let Ok(group_key) = GroupKeyV1::deserialize(&data.data.as_slice()) {
+                    keys.insert(group_key.key_version, group_key);
+                }
+            }
+        }
+
+        Ok(keys)
+    }
+
     /// Fetch GroupKeyV1 with full account metadata for ZK proofs
     /// Returns: (GroupKeyV1, address, hash)
     pub async fn get_my_group_key_with_hash(
@@ -298,6 +383,121 @@ impl SolcryptClient {
             }
             None => Ok(None),
         }
+    }
+
+    /// Get a specific member's GroupKeyV1 with its hash (for removal/role changes)
+    pub async fn get_member_group_key_with_hash(
+        &self,
+        group_id: &[u8; 32],
+        member: &Pubkey,
+    ) -> Result<Option<(GroupKeyV1, [u8; 32], [u8; 32])>> {
+        // Get the group account to know the current key version
+        let group_account = match self.get_group_account(group_id).await? {
+            Some(acc) => acc,
+            None => return Ok(None),
+        };
+
+        // Derive the address for the member's GroupKeyV1
+        let address_tree_info = self.rpc.get_address_tree_v1();
+        let key_version_bytes = group_account.current_key_version.to_le_bytes();
+
+        let (key_address, _) = derive_address(
+            &[
+                GROUP_KEY_SEED,
+                group_id,
+                member.as_ref(),
+                &key_version_bytes,
+            ],
+            &address_tree_info.tree,
+            &solcrypt_program::ID.into(),
+        );
+
+        // Fetch the compressed account
+        match self
+            .rpc
+            .get_compressed_account(key_address, None)
+            .await?
+            .value
+        {
+            Some(account) => {
+                let group_key =
+                    GroupKeyV1::deserialize(&account.data.as_ref().unwrap().data.as_slice())
+                        .context("Failed to deserialize GroupKeyV1")?;
+
+                Ok(Some((group_key, key_address, account.hash)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Get all members of a group at the current key version
+    /// Returns list of (GroupKeyV1, address, hash) for each member
+    pub async fn get_group_members(
+        &self,
+        group_id: &[u8; 32],
+    ) -> Result<Vec<(GroupKeyV1, [u8; 32], [u8; 32])>> {
+        use solcrypt_program::AccountDiscriminator;
+
+        // Get the group account to know the current key version
+        let group_account = self
+            .get_group_account(group_id)
+            .await?
+            .context("Group not found")?;
+
+        let key_version = group_account.current_key_version;
+        let key_version_bytes = key_version.to_le_bytes();
+
+        // GroupKeyV1 layout:
+        // - discriminator: 1 byte (offset 0)
+        // - group_id: 32 bytes (offset 1)
+        // - member: 32 bytes (offset 33)
+        // - key_version: 4 bytes (offset 65)
+        // - role: 1 byte (offset 69)
+        // - encrypted_aes_key: 48 bytes (offset 70)
+
+        // Build filter bytes: discriminator + group_id + ... + key_version
+        // We need to filter by discriminator (1 byte) + group_id (32 bytes) at offset 0
+        let discriminator_byte = AccountDiscriminator::GroupKeyV1 as u8;
+        let mut filter_bytes = vec![discriminator_byte];
+        filter_bytes.extend_from_slice(group_id);
+
+        // Query all GroupKeyV1 accounts for this group
+        let accounts = self
+            .rpc
+            .get_compressed_accounts_by_owner(
+                &solcrypt_program::ID.into(),
+                Some(GetCompressedAccountsByOwnerConfig {
+                    filters: Some(vec![GetCompressedAccountsFilter {
+                        bytes: filter_bytes,
+                        offset: 0, // Start from discriminator
+                    }]),
+                    data_slice: None,
+                    cursor: None,
+                    limit: None,
+                }),
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to get group members: {:?}", e))?
+            .value
+            .items;
+
+        let mut members = Vec::new();
+
+        for account in accounts {
+            if let Some(data) = &account.data {
+                if let Ok(group_key) = GroupKeyV1::deserialize(&data.data.as_slice()) {
+                    // Only include members at current key version (filters out old rotated keys)
+                    if group_key.key_version == key_version {
+                        if let Some(address) = account.address {
+                            members.push((group_key, address, account.hash));
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(members)
     }
 
     /// Get validity proof for an existing compressed account (for updates/closes)

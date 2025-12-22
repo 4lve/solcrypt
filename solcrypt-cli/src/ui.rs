@@ -8,7 +8,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::app::{App, InputMode, ListTab, Screen};
+use crate::app::{App, GroupMemberInfo, InputMode, ListTab, Screen};
 use crate::client::{format_group_id, format_pubkey};
 
 /// Render the application UI
@@ -20,6 +20,16 @@ pub fn render(frame: &mut Frame, app: &App) {
         Screen::NewChat => render_new_chat(frame, app),
         Screen::NewGroup => render_new_group(frame, app),
         Screen::InviteMember { group_id } => render_invite_member(frame, app, group_id),
+        Screen::RemoveMember {
+            group_id,
+            members,
+            selected,
+        } => render_remove_member(frame, group_id, members, *selected),
+        Screen::SetMemberRole {
+            group_id,
+            members,
+            selected,
+        } => render_set_member_role(frame, group_id, members, *selected),
         Screen::Loading { message } => render_loading(frame, message),
         Screen::Error { message } => render_error(frame, message),
     }
@@ -464,7 +474,9 @@ fn render_group_chat(frame: &mut Frame, app: &App, group_id: &[u8; 32]) {
 
     // Help
     let help_text = match app.input_mode {
-        InputMode::Normal => "i: Type | a: Add Member | r: Refresh | Esc: Back | q: Quit",
+        InputMode::Normal => {
+            "i: Type | a: Add | x: Remove | p: Role | k: Rotate Key | l: Leave | Esc: Back"
+        }
         InputMode::Editing => "Enter: Send | Esc: Cancel",
     };
     let help =
@@ -571,6 +583,134 @@ fn render_invite_member(frame: &mut Frame, app: &App, group_id: &[u8; 32]) {
     // Help
     let help =
         Paragraph::new(" Enter: Invite | Esc: Cancel").style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(help, chunks[2]);
+}
+
+/// Render the remove member dialog with member list
+fn render_remove_member(
+    frame: &mut Frame,
+    group_id: &[u8; 32],
+    members: &[GroupMemberInfo],
+    selected: usize,
+) {
+    let area = centered_rect(70, 50, frame.area());
+
+    frame.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Title
+            Constraint::Min(5),    // Member list
+            Constraint::Length(2), // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new(format!(" Remove from Group: {}", format_group_id(group_id)))
+        .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(title, chunks[0]);
+
+    // Member list
+    let member_items: Vec<ListItem> = members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let style = if i == selected {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            let role_color = match m.role {
+                2 => Color::Yellow, // Owner
+                1 => Color::Cyan,   // Admin
+                _ => Color::White,  // Member
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {} ", format_pubkey(&m.pubkey)), style),
+                Span::styled(
+                    format!("[{}]", m.role_name),
+                    Style::default().fg(role_color),
+                ),
+            ]))
+        })
+        .collect();
+
+    let member_list = List::new(member_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Select Member to Remove "),
+    );
+    frame.render_widget(member_list, chunks[1]);
+
+    let help = Paragraph::new(" ↑↓/jk: Navigate | Enter: Remove | Esc: Cancel")
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(help, chunks[2]);
+}
+
+/// Render the set member role dialog with member list
+fn render_set_member_role(
+    frame: &mut Frame,
+    group_id: &[u8; 32],
+    members: &[GroupMemberInfo],
+    selected: usize,
+) {
+    let area = centered_rect(70, 50, frame.area());
+
+    frame.render_widget(Clear, area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // Title
+            Constraint::Min(5),    // Member list
+            Constraint::Length(2), // Help
+        ])
+        .split(area);
+
+    let title = Paragraph::new(format!(" Set Role in Group: {}", format_group_id(group_id)))
+        .style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .block(Block::default().borders(Borders::ALL));
+    frame.render_widget(title, chunks[0]);
+
+    // Member list
+    let member_items: Vec<ListItem> = members
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            let style = if i == selected {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default()
+            };
+            let role_color = match m.role {
+                2 => Color::Yellow, // Owner
+                1 => Color::Cyan,   // Admin
+                _ => Color::White,  // Member
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {} ", format_pubkey(&m.pubkey)), style),
+                Span::styled(
+                    format!("[{}]", m.role_name),
+                    Style::default().fg(role_color),
+                ),
+            ]))
+        })
+        .collect();
+
+    let member_list = List::new(member_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Select Member "),
+    );
+    frame.render_widget(member_list, chunks[1]);
+
+    let help = Paragraph::new(" ↑↓/jk: Navigate | m: Set Member | a: Set Admin | Esc: Cancel")
+        .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(help, chunks[2]);
 }
 

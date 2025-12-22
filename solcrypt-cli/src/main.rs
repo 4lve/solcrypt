@@ -362,6 +362,160 @@ async fn run_app(
                             }
                         }
                     }
+                    EventResult::LoadMembersForRemove(group_id) => {
+                        app.screen = Screen::Loading {
+                            message: "Loading members...".to_string(),
+                        };
+                        terminal.draw(|f| ui::render(f, app))?;
+
+                        match load_group_member_list(client, &group_id).await {
+                            Ok(members) => {
+                                // Filter out owner (can't remove owner)
+                                let removable: Vec<_> = members
+                                    .into_iter()
+                                    .filter(|m| m.role != 2) // Not owner
+                                    .collect();
+                                app.navigate_to(Screen::RemoveMember {
+                                    group_id,
+                                    members: removable,
+                                    selected: 0,
+                                });
+                            }
+                            Err(e) => {
+                                app.navigate_to(Screen::Error {
+                                    message: format!("Failed to load members: {:#}", e),
+                                });
+                            }
+                        }
+                    }
+                    EventResult::LoadMembersForRole(group_id) => {
+                        app.screen = Screen::Loading {
+                            message: "Loading members...".to_string(),
+                        };
+                        terminal.draw(|f| ui::render(f, app))?;
+
+                        match load_group_member_list(client, &group_id).await {
+                            Ok(members) => {
+                                // Filter out owner (can't change owner's role)
+                                let changeable: Vec<_> = members
+                                    .into_iter()
+                                    .filter(|m| m.role != 2) // Not owner
+                                    .collect();
+                                app.navigate_to(Screen::SetMemberRole {
+                                    group_id,
+                                    members: changeable,
+                                    selected: 0,
+                                });
+                            }
+                            Err(e) => {
+                                app.navigate_to(Screen::Error {
+                                    message: format!("Failed to load members: {:#}", e),
+                                });
+                            }
+                        }
+                    }
+                    EventResult::RemoveMember(target) => {
+                        let group_id = if let Screen::RemoveMember { group_id, .. } = &app.screen {
+                            *group_id
+                        } else {
+                            continue;
+                        };
+
+                        app.screen = Screen::Loading {
+                            message: "Removing member...".to_string(),
+                        };
+                        terminal.draw(|f| ui::render(f, app))?;
+
+                        match remove_member(client, &group_id, &target).await {
+                            Ok(_) => {
+                                app.navigate_to(Screen::GroupChat { group_id });
+                                load_group_messages(app, client, x25519_secret, &group_id).await?;
+                                app.set_status("Member removed successfully!");
+                            }
+                            Err(e) => {
+                                app.navigate_to(Screen::Error {
+                                    message: format!("Failed to remove: {:#}", e),
+                                });
+                            }
+                        }
+                    }
+                    EventResult::LeaveGroup => {
+                        let group_id = if let Screen::GroupChat { group_id } = &app.screen {
+                            *group_id
+                        } else {
+                            continue;
+                        };
+
+                        app.screen = Screen::Loading {
+                            message: "Leaving group...".to_string(),
+                        };
+                        terminal.draw(|f| ui::render(f, app))?;
+
+                        match leave_group(client, &group_id).await {
+                            Ok(_) => {
+                                app.clear_current_group();
+                                app.navigate_to(Screen::ChatList);
+                                load_chats(app, client).await?;
+                                app.set_status("Left group successfully!");
+                            }
+                            Err(e) => {
+                                app.navigate_to(Screen::Error {
+                                    message: format!("Failed to leave: {:#}", e),
+                                });
+                            }
+                        }
+                    }
+                    EventResult::SetMemberRole(target, new_role) => {
+                        let group_id = if let Screen::SetMemberRole { group_id, .. } = &app.screen {
+                            *group_id
+                        } else {
+                            continue;
+                        };
+
+                        app.screen = Screen::Loading {
+                            message: "Updating role...".to_string(),
+                        };
+                        terminal.draw(|f| ui::render(f, app))?;
+
+                        match set_member_role(client, &group_id, &target, new_role).await {
+                            Ok(_) => {
+                                app.navigate_to(Screen::GroupChat { group_id });
+                                load_group_messages(app, client, x25519_secret, &group_id).await?;
+                                let role_name = if new_role == 1 { "Admin" } else { "Member" };
+                                app.set_status(format!("Role updated to {}!", role_name));
+                            }
+                            Err(e) => {
+                                app.navigate_to(Screen::Error {
+                                    message: format!("Failed to update role: {:#}", e),
+                                });
+                            }
+                        }
+                    }
+                    EventResult::RotateGroupKey => {
+                        let group_id = if let Screen::GroupChat { group_id } = &app.screen {
+                            *group_id
+                        } else {
+                            continue;
+                        };
+
+                        app.screen = Screen::Loading {
+                            message: "Rotating group key...".to_string(),
+                        };
+                        terminal.draw(|f| ui::render(f, app))?;
+
+                        match rotate_group_key(client, x25519_secret, &group_id).await {
+                            Ok(_) => {
+                                app.navigate_to(Screen::GroupChat { group_id });
+                                load_group_messages(app, client, x25519_secret, &group_id).await?;
+                                app.set_status("Group key rotated successfully!");
+                            }
+                            Err(e) => {
+                                app.navigate_to(Screen::Error {
+                                    message: format!("Failed to rotate key: {:#}", e),
+                                });
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -617,6 +771,111 @@ async fn invite_member(
     Ok(())
 }
 
+/// Remove a member from the group (admin action)
+async fn remove_member(
+    client: &mut SolcryptClient,
+    group_id: &[u8; 32],
+    target: &Pubkey,
+) -> Result<()> {
+    let tx = instructions::create_remove_from_group_transaction(client, *group_id, target).await?;
+    client.send_and_confirm_transaction(tx).await?;
+    Ok(())
+}
+
+/// Leave a group voluntarily
+async fn leave_group(client: &mut SolcryptClient, group_id: &[u8; 32]) -> Result<()> {
+    let tx = instructions::create_leave_group_transaction(client, *group_id).await?;
+    client.send_and_confirm_transaction(tx).await?;
+    Ok(())
+}
+
+/// Set a member's role (owner action)
+async fn set_member_role(
+    client: &mut SolcryptClient,
+    group_id: &[u8; 32],
+    target: &Pubkey,
+    new_role: u8,
+) -> Result<()> {
+    let tx = instructions::create_set_member_role_transaction(client, *group_id, target, new_role)
+        .await?;
+    client.send_and_confirm_transaction(tx).await?;
+    Ok(())
+}
+
+/// Load group member list for display in UI
+async fn load_group_member_list(
+    client: &mut SolcryptClient,
+    group_id: &[u8; 32],
+) -> Result<Vec<app::GroupMemberInfo>> {
+    let members = client.get_group_members(group_id).await?;
+
+    Ok(members
+        .into_iter()
+        .map(|(group_key, _, _)| {
+            let role_name = match group_key.role {
+                2 => "Owner".to_string(),
+                1 => "Admin".to_string(),
+                _ => "Member".to_string(),
+            };
+            app::GroupMemberInfo {
+                pubkey: Pubkey::from(group_key.member),
+                role: group_key.role,
+                role_name,
+            }
+        })
+        .collect())
+}
+
+/// Rotate group key - generates new AES key and re-encrypts for all members
+async fn rotate_group_key(
+    client: &mut SolcryptClient,
+    x25519_secret: &x25519_dalek::StaticSecret,
+    group_id: &[u8; 32],
+) -> Result<()> {
+    use crate::crypto::{encrypt_group_key_for_member, generate_group_aes_key};
+    use x25519_dalek::PublicKey as X25519PublicKey;
+
+    // Get all current members
+    let members = client.get_group_members(group_id).await?;
+    if members.is_empty() {
+        anyhow::bail!("No members found in group");
+    }
+
+    // Generate new AES key
+    let new_aes_key = generate_group_aes_key();
+
+    // Encrypt the new key for each member
+    let mut new_encrypted_keys: Vec<(Pubkey, u8, [u8; 48])> = Vec::new();
+
+    for (group_key, _, _) in &members {
+        let member_pubkey = Pubkey::from(group_key.member);
+
+        // Get member's X25519 pubkey
+        let member_x25519_bytes = client
+            .get_user_x25519_pubkey(&member_pubkey)
+            .await?
+            .context(format!(
+                "Member {} has not initialized their account",
+                member_pubkey
+            ))?;
+        let member_x25519 = X25519PublicKey::from(member_x25519_bytes);
+
+        // Encrypt the new AES key for this member
+        let encrypted_key =
+            encrypt_group_key_for_member(&new_aes_key, x25519_secret, &member_x25519);
+
+        new_encrypted_keys.push((member_pubkey, group_key.role, encrypted_key));
+    }
+
+    // Send the rotation transaction
+    let tx =
+        instructions::create_rotate_group_key_transaction(client, *group_id, new_encrypted_keys)
+            .await?;
+    client.send_and_confirm_transaction(tx).await?;
+
+    Ok(())
+}
+
 /// Load group messages
 async fn load_group_messages(
     app: &mut App,
@@ -630,12 +889,6 @@ async fn load_group_messages(
         .await?
         .context("Group not found")?;
 
-    // Get my GroupKeyV1 to get the encrypted AES key
-    let (group_key, _) = client
-        .get_my_group_key(group_id)
-        .await?
-        .context("You are not a member of this group")?;
-
     // Get the group owner's X25519 pubkey to derive the decryption key
     let owner_x25519_bytes = client
         .get_user_x25519_pubkey(&Pubkey::from(group_account.owner))
@@ -643,15 +896,36 @@ async fn load_group_messages(
         .context("Group owner not initialized")?;
     let owner_x25519 = X25519PublicKey::from(owner_x25519_bytes);
 
-    // Decrypt the AES key
-    let aes_key = decrypt_group_key(&group_key.encrypted_aes_key, x25519_secret, &owner_x25519)?;
+    // Get ALL my GroupKeyV1 accounts (all versions I have access to)
+    let my_keys = client.get_my_group_keys_all_versions(group_id).await?;
+    if my_keys.is_empty() {
+        anyhow::bail!("You are not a member of this group");
+    }
 
-    // Store the group context
-    app.set_current_group(*group_id, aes_key);
+    // Decrypt AES keys for each version I have
+    let mut decrypted_keys: std::collections::HashMap<u32, [u8; 32]> =
+        std::collections::HashMap::new();
+    for (version, group_key) in &my_keys {
+        if let Ok(aes_key) =
+            decrypt_group_key(&group_key.encrypted_aes_key, x25519_secret, &owner_x25519)
+        {
+            decrypted_keys.insert(*version, aes_key);
+        }
+    }
 
-    // Fetch and decrypt messages
+    // Get current version's key for new messages
+    let current_version = group_account.current_key_version;
+    let current_aes_key = decrypted_keys
+        .get(&current_version)
+        .copied()
+        .context("Missing key for current version")?;
+
+    // Store the current group context (for sending new messages)
+    app.set_current_group(*group_id, current_aes_key);
+
+    // Fetch and decrypt messages using the appropriate key per message
     let messages = client.get_group_messages(group_id).await?;
-    app.update_group_messages(messages, &aes_key);
+    app.update_group_messages_with_keys(messages, &decrypted_keys);
 
     Ok(())
 }

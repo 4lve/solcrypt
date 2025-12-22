@@ -1,6 +1,7 @@
 //! Event handling for keyboard input.
 
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyModifiers};
+use solana_sdk::pubkey::Pubkey;
 use std::time::Duration;
 
 use crate::app::{App, InputMode, ListTab, Screen};
@@ -33,6 +34,18 @@ pub enum EventResult {
     LoadGroupMessages,
     /// Invite member to current group
     InviteMember(String),
+    /// Remove member from group (admin action) - takes pubkey
+    RemoveMember(Pubkey),
+    /// Leave group voluntarily
+    LeaveGroup,
+    /// Set member role (owner action) - takes pubkey and new role
+    SetMemberRole(Pubkey, u8),
+    /// Rotate group key (owner action)
+    RotateGroupKey,
+    /// Load members for remove screen
+    LoadMembersForRemove([u8; 32]),
+    /// Load members for role change screen
+    LoadMembersForRole([u8; 32]),
 }
 
 /// Poll for events with timeout
@@ -59,6 +72,8 @@ pub fn handle_key_event(app: &mut App, key: KeyEvent) -> EventResult {
         Screen::NewChat => handle_new_chat_keys(app, key),
         Screen::NewGroup => handle_new_group_keys(app, key),
         Screen::InviteMember { .. } => handle_invite_member_keys(app, key),
+        Screen::RemoveMember { .. } => handle_remove_member_keys(app, key),
+        Screen::SetMemberRole { .. } => handle_set_member_role_keys(app, key),
         Screen::Loading { .. } => EventResult::Continue,
         Screen::Error { .. } => {
             // Any key dismisses error
@@ -275,6 +290,28 @@ fn handle_group_chat_keys(app: &mut App, key: KeyEvent) -> EventResult {
                 }
                 EventResult::Continue
             }
+            KeyCode::Char('l') => {
+                // Leave group
+                EventResult::LeaveGroup
+            }
+            KeyCode::Char('x') => {
+                // Remove member - needs to load members first
+                if let Screen::GroupChat { group_id } = app.screen {
+                    return EventResult::LoadMembersForRemove(group_id);
+                }
+                EventResult::Continue
+            }
+            KeyCode::Char('p') => {
+                // Promote/demote - needs to load members first
+                if let Screen::GroupChat { group_id } = app.screen {
+                    return EventResult::LoadMembersForRole(group_id);
+                }
+                EventResult::Continue
+            }
+            KeyCode::Char('k') => {
+                // Rotate group key (owner only)
+                EventResult::RotateGroupKey
+            }
             KeyCode::Char('r') => EventResult::LoadGroupMessages,
             KeyCode::Up | KeyCode::Char('k') => {
                 app.scroll_up();
@@ -376,5 +413,90 @@ fn handle_invite_member_keys(app: &mut App, key: KeyEvent) -> EventResult {
             EventResult::Continue
         }
         _ => EventResult::Continue,
+    }
+}
+
+/// Handle keys in remove member dialog (with member list)
+fn handle_remove_member_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    if let Screen::RemoveMember {
+        group_id: _,
+        members,
+        selected,
+    } = &mut app.screen
+    {
+        match key.code {
+            KeyCode::Esc => {
+                app.go_back();
+                EventResult::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if *selected > 0 {
+                    *selected -= 1;
+                }
+                EventResult::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected < members.len().saturating_sub(1) {
+                    *selected += 1;
+                }
+                EventResult::Continue
+            }
+            KeyCode::Enter => {
+                if let Some(member) = members.get(*selected) {
+                    return EventResult::RemoveMember(member.pubkey);
+                }
+                EventResult::Continue
+            }
+            _ => EventResult::Continue,
+        }
+    } else {
+        EventResult::Continue
+    }
+}
+
+/// Handle keys in set member role dialog (with member list)
+/// 'm' = set to member, 'a' = set to admin
+fn handle_set_member_role_keys(app: &mut App, key: KeyEvent) -> EventResult {
+    if let Screen::SetMemberRole {
+        group_id: _,
+        members,
+        selected,
+    } = &mut app.screen
+    {
+        match key.code {
+            KeyCode::Esc => {
+                app.go_back();
+                EventResult::Continue
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if *selected > 0 {
+                    *selected -= 1;
+                }
+                EventResult::Continue
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if *selected < members.len().saturating_sub(1) {
+                    *selected += 1;
+                }
+                EventResult::Continue
+            }
+            KeyCode::Char('m') => {
+                // Set to member (role 0)
+                if let Some(member) = members.get(*selected) {
+                    return EventResult::SetMemberRole(member.pubkey, 0);
+                }
+                EventResult::Continue
+            }
+            KeyCode::Char('a') => {
+                // Set to admin (role 1)
+                if let Some(member) = members.get(*selected) {
+                    return EventResult::SetMemberRole(member.pubkey, 1);
+                }
+                EventResult::Continue
+            }
+            _ => EventResult::Continue,
+        }
+    } else {
+        EventResult::Continue
     }
 }

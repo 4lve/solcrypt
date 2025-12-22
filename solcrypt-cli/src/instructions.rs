@@ -790,3 +790,496 @@ pub async fn create_send_group_message_transaction(
 
     Ok(transaction)
 }
+
+// ============================================================================
+// GROUP MANAGEMENT INSTRUCTIONS
+// ============================================================================
+
+/// Build a RemoveFromGroup instruction - admin removes a member
+pub async fn build_remove_from_group_instruction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    target: &Pubkey,
+) -> Result<Instruction> {
+    use solcrypt_program::{CompressedAccountMetaCodama, RemoveFromGroupData};
+
+    let signer = client.payer.pubkey();
+    let (user_pda, _) = SolcryptClient::get_user_pda(&signer);
+    let (group_pda, _) = SolcryptClient::get_group_pda(&group_id);
+    let (target_user_pda, _) = SolcryptClient::get_user_pda(target);
+
+    // Get tree info
+    let state_tree_info = client
+        .rpc
+        .get_random_state_tree_info()
+        .map_err(|e| anyhow::anyhow!("Failed to get state tree info: {:?}", e))?;
+    let merkle_tree_pubkey = state_tree_info.tree;
+
+    // Get signer's GroupKeyV1 with hash for ZK proof (proves role)
+    let (signer_key, signer_key_address, signer_key_hash) = client
+        .get_my_group_key_with_hash(&group_id)
+        .await?
+        .context("You are not a member of this group")?;
+
+    // Get target's GroupKeyV1 with hash for closing
+    let (target_key, target_key_address, target_key_hash) = client
+        .get_member_group_key_with_hash(&group_id, target)
+        .await?
+        .context("Target is not a member of this group")?;
+
+    // Setup packed accounts
+    let system_account_meta_config = SystemAccountMetaConfig::new(solcrypt_program::ID.into());
+    let mut packed_accounts = PackedAccounts::default();
+    packed_accounts.add_pre_accounts_signer(signer);
+    packed_accounts
+        .add_system_accounts(system_account_meta_config)
+        .map_err(|e| anyhow::anyhow!("Failed to add system accounts: {:?}", e))?;
+
+    // Get validity proof for both accounts
+    let rpc_result = client
+        .rpc
+        .get_validity_proof(vec![signer_key_hash, target_key_hash], vec![], None)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get validity proof: {:?}", e))?;
+
+    let output_merkle_tree_index = packed_accounts.insert_or_get(merkle_tree_pubkey);
+    let packed_tree_infos = rpc_result.value.pack_tree_infos(&mut packed_accounts);
+
+    let state_trees = packed_tree_infos
+        .state_trees
+        .as_ref()
+        .context("No state trees in proof result")?;
+
+    let signer_key_tree_info = state_trees
+        .packed_tree_infos
+        .get(0)
+        .context("Signer tree info missing")?
+        .clone();
+
+    let target_key_tree_info = state_trees
+        .packed_tree_infos
+        .get(1)
+        .context("Target tree info missing")?
+        .clone();
+
+    let (light_accounts, _, _) = packed_accounts.to_account_metas();
+
+    let signer_account_meta = CompressedAccountMetaCodama {
+        tree_info: signer_key_tree_info.into(),
+        address: signer_key_address,
+        output_state_tree_index: output_merkle_tree_index,
+    };
+
+    let target_account_meta = CompressedAccountMetaCodama {
+        tree_info: target_key_tree_info.into(),
+        address: target_key_address,
+        output_state_tree_index: output_merkle_tree_index,
+    };
+
+    let instruction_data = RemoveFromGroupData {
+        discriminator: InstructionType::RemoveFromGroup,
+        proof: rpc_result.value.proof.into(),
+        signer_account_meta,
+        signer_key_version: signer_key.key_version,
+        signer_role: signer_key.role,
+        signer_encrypted_aes_key: signer_key.encrypted_aes_key,
+        target_account_meta,
+        target_key_version: target_key.key_version,
+        target_role: target_key.role,
+        target_encrypted_aes_key: target_key.encrypted_aes_key,
+        group_id,
+        target: target.to_bytes().into(),
+    };
+    let data = RemoveFromGroupData::serialize(&instruction_data)
+        .context("Failed to serialize RemoveFromGroupData")?;
+
+    // Account order must match processor:
+    // 0: signer
+    // 1: group_account_info
+    // 2: target_user_account
+    // 3+: light system accounts
+    let mut accounts = vec![
+        light_accounts[0].clone(), // signer
+        AccountMeta::new_readonly(group_pda, false),
+        AccountMeta::new(target_user_pda, false),
+    ];
+    accounts.extend(light_accounts[1..].iter().cloned());
+
+    Ok(Instruction {
+        program_id: solcrypt_program::ID.into(),
+        accounts,
+        data,
+    })
+}
+
+/// Create and sign a transaction for removing a member from a group
+pub async fn create_remove_from_group_transaction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    target: &Pubkey,
+) -> Result<Transaction> {
+    let instruction = build_remove_from_group_instruction(client, group_id, target).await?;
+
+    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+    let blockhash = client.get_recent_blockhash().await?;
+
+    let transaction = Transaction::new_signed_with_payer(
+        &[compute_budget_ix, instruction],
+        Some(&client.payer.pubkey()),
+        &[&client.payer],
+        blockhash,
+    );
+
+    Ok(transaction)
+}
+
+/// Build a LeaveGroup instruction - member voluntarily leaves
+pub async fn build_leave_group_instruction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+) -> Result<Instruction> {
+    use solcrypt_program::{CompressedAccountMetaCodama, LeaveGroupData};
+
+    let signer = client.payer.pubkey();
+    let (user_pda, _) = SolcryptClient::get_user_pda(&signer);
+    let (group_pda, _) = SolcryptClient::get_group_pda(&group_id);
+
+    // Get tree info
+    let state_tree_info = client
+        .rpc
+        .get_random_state_tree_info()
+        .map_err(|e| anyhow::anyhow!("Failed to get state tree info: {:?}", e))?;
+    let merkle_tree_pubkey = state_tree_info.tree;
+
+    // Get signer's GroupKeyV1 with hash for closing
+    let (signer_key, signer_key_address, signer_key_hash) = client
+        .get_my_group_key_with_hash(&group_id)
+        .await?
+        .context("You are not a member of this group")?;
+
+    // Setup packed accounts
+    let system_account_meta_config = SystemAccountMetaConfig::new(solcrypt_program::ID.into());
+    let mut packed_accounts = PackedAccounts::default();
+    packed_accounts.add_pre_accounts_signer(signer);
+    packed_accounts
+        .add_system_accounts(system_account_meta_config)
+        .map_err(|e| anyhow::anyhow!("Failed to add system accounts: {:?}", e))?;
+
+    // Get validity proof for closing the account
+    let rpc_result = client
+        .rpc
+        .get_validity_proof(vec![signer_key_hash], vec![], None)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get validity proof: {:?}", e))?;
+
+    let output_merkle_tree_index = packed_accounts.insert_or_get(merkle_tree_pubkey);
+    let packed_tree_infos = rpc_result.value.pack_tree_infos(&mut packed_accounts);
+
+    let state_trees = packed_tree_infos
+        .state_trees
+        .as_ref()
+        .context("No state trees in proof result")?;
+
+    let signer_key_tree_info = state_trees
+        .packed_tree_infos
+        .first()
+        .context("State trees list is empty")?
+        .clone();
+
+    let (light_accounts, _, _) = packed_accounts.to_account_metas();
+
+    let account_meta = CompressedAccountMetaCodama {
+        tree_info: signer_key_tree_info.into(),
+        address: signer_key_address,
+        output_state_tree_index: output_merkle_tree_index,
+    };
+
+    let instruction_data = LeaveGroupData {
+        discriminator: InstructionType::LeaveGroup,
+        proof: rpc_result.value.proof.into(),
+        account_meta,
+        key_version: signer_key.key_version,
+        role: signer_key.role,
+        encrypted_aes_key: signer_key.encrypted_aes_key,
+        group_id,
+    };
+    let data = LeaveGroupData::serialize(&instruction_data)
+        .context("Failed to serialize LeaveGroupData")?;
+
+    let mut accounts = vec![
+        light_accounts[0].clone(), // signer
+        AccountMeta::new(user_pda, false),
+        AccountMeta::new_readonly(group_pda, false),
+    ];
+    accounts.extend(light_accounts[1..].iter().cloned());
+
+    Ok(Instruction {
+        program_id: solcrypt_program::ID.into(),
+        accounts,
+        data,
+    })
+}
+
+/// Create and sign a transaction for leaving a group
+pub async fn create_leave_group_transaction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+) -> Result<Transaction> {
+    let instruction = build_leave_group_instruction(client, group_id).await?;
+
+    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_000_000);
+    let blockhash = client.get_recent_blockhash().await?;
+
+    let transaction = Transaction::new_signed_with_payer(
+        &[compute_budget_ix, instruction],
+        Some(&client.payer.pubkey()),
+        &[&client.payer],
+        blockhash,
+    );
+
+    Ok(transaction)
+}
+
+/// Build a SetMemberRole instruction - owner promotes/demotes admins
+pub async fn build_set_member_role_instruction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    target: &Pubkey,
+    new_role: u8,
+) -> Result<Instruction> {
+    use solcrypt_program::{CompressedAccountMetaCodama, SetMemberRoleData};
+
+    let signer = client.payer.pubkey();
+    let (group_pda, _) = SolcryptClient::get_group_pda(&group_id);
+
+    // Get tree info
+    let state_tree_info = client
+        .rpc
+        .get_random_state_tree_info()
+        .map_err(|e| anyhow::anyhow!("Failed to get state tree info: {:?}", e))?;
+    let merkle_tree_pubkey = state_tree_info.tree;
+
+    // Get target's GroupKeyV1 with hash for updating
+    let (target_key, target_key_address, target_key_hash) = client
+        .get_member_group_key_with_hash(&group_id, target)
+        .await?
+        .context("Target is not a member of this group")?;
+
+    // Setup packed accounts
+    let system_account_meta_config = SystemAccountMetaConfig::new(solcrypt_program::ID.into());
+    let mut packed_accounts = PackedAccounts::default();
+    packed_accounts.add_pre_accounts_signer(signer);
+    packed_accounts
+        .add_system_accounts(system_account_meta_config)
+        .map_err(|e| anyhow::anyhow!("Failed to add system accounts: {:?}", e))?;
+
+    // Get validity proof for updating the account
+    let rpc_result = client
+        .rpc
+        .get_validity_proof(vec![target_key_hash], vec![], None)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get validity proof: {:?}", e))?;
+
+    let output_merkle_tree_index = packed_accounts.insert_or_get(merkle_tree_pubkey);
+    let packed_tree_infos = rpc_result.value.pack_tree_infos(&mut packed_accounts);
+
+    let state_trees = packed_tree_infos
+        .state_trees
+        .as_ref()
+        .context("No state trees in proof result")?;
+
+    let target_key_tree_info = state_trees
+        .packed_tree_infos
+        .first()
+        .context("State trees list is empty")?
+        .clone();
+
+    let (light_accounts, _, _) = packed_accounts.to_account_metas();
+
+    let account_meta = CompressedAccountMetaCodama {
+        tree_info: target_key_tree_info.into(),
+        address: target_key_address,
+        output_state_tree_index: output_merkle_tree_index,
+    };
+
+    let instruction_data = SetMemberRoleData {
+        discriminator: InstructionType::SetMemberRole,
+        proof: rpc_result.value.proof.into(),
+        account_meta,
+        current_key_version: target_key.key_version,
+        current_role: target_key.role,
+        encrypted_aes_key: target_key.encrypted_aes_key,
+        group_id,
+        target: target.to_bytes().into(),
+        new_role,
+    };
+    let data = SetMemberRoleData::serialize(&instruction_data)
+        .context("Failed to serialize SetMemberRoleData")?;
+
+    let mut accounts = vec![
+        light_accounts[0].clone(), // signer
+        AccountMeta::new_readonly(group_pda, false),
+    ];
+    accounts.extend(light_accounts[1..].iter().cloned());
+
+    Ok(Instruction {
+        program_id: solcrypt_program::ID.into(),
+        accounts,
+        data,
+    })
+}
+
+/// Create and sign a transaction for setting a member's role
+pub async fn create_set_member_role_transaction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    target: &Pubkey,
+    new_role: u8,
+) -> Result<Transaction> {
+    let instruction = build_set_member_role_instruction(client, group_id, target, new_role).await?;
+
+    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_000_000);
+    let blockhash = client.get_recent_blockhash().await?;
+
+    let transaction = Transaction::new_signed_with_payer(
+        &[compute_budget_ix, instruction],
+        Some(&client.payer.pubkey()),
+        &[&client.payer],
+        blockhash,
+    );
+
+    Ok(transaction)
+}
+
+/// Build a RotateGroupKey instruction - owner rotates the encryption key
+/// This creates new GroupKeyV1 accounts for all accepted members with the new key version
+pub async fn build_rotate_group_key_instruction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    new_encrypted_keys: Vec<(Pubkey, u8, [u8; 48])>, // (member, role, encrypted_aes_key)
+) -> Result<Instruction> {
+    use solcrypt_program::{PackedAddressTreeInfoCodama, RotateGroupKeyData, RotationKeyEntry};
+
+    let signer = client.payer.pubkey();
+    let (group_pda, _) = SolcryptClient::get_group_pda(&group_id);
+
+    // Get current group account to determine new key version
+    let group_account = client
+        .get_group_account(&group_id)
+        .await?
+        .context("Group not found")?;
+    let new_key_version = group_account.current_key_version + 1;
+
+    // Get tree info
+    let address_tree_info: TreeInfo = client.rpc.get_address_tree_v1();
+    let state_tree_info = client
+        .rpc
+        .get_random_state_tree_info()
+        .map_err(|e| anyhow::anyhow!("Failed to get state tree info: {:?}", e))?;
+
+    let address_tree_pubkey = address_tree_info.tree;
+    let merkle_tree_pubkey = state_tree_info.tree;
+
+    // Derive addresses for all new GroupKeyV1 accounts
+    let key_version_bytes = new_key_version.to_le_bytes();
+    let mut new_addresses: Vec<AddressWithTree> = Vec::new();
+
+    for (member, _, _) in &new_encrypted_keys {
+        let (key_address, _) = derive_address(
+            &[
+                GROUP_KEY_SEED,
+                &group_id,
+                member.as_ref(),
+                &key_version_bytes,
+            ],
+            &address_tree_pubkey,
+            &solcrypt_program::ID.into(),
+        );
+        new_addresses.push(AddressWithTree {
+            address: key_address,
+            tree: address_tree_pubkey,
+        });
+    }
+
+    // Setup packed accounts
+    let system_account_meta_config = SystemAccountMetaConfig::new(solcrypt_program::ID.into());
+    let mut packed_accounts = PackedAccounts::default();
+    packed_accounts.add_pre_accounts_signer(signer);
+    packed_accounts
+        .add_system_accounts(system_account_meta_config)
+        .map_err(|e| anyhow::anyhow!("Failed to add system accounts: {:?}", e))?;
+
+    // Get validity proof for all new addresses
+    let rpc_result = client
+        .rpc
+        .get_validity_proof(vec![], new_addresses, None)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to get validity proof: {:?}", e))?;
+
+    let output_merkle_tree_index = packed_accounts.insert_or_get(merkle_tree_pubkey);
+    let packed_tree_infos = rpc_result.value.pack_tree_infos(&mut packed_accounts);
+
+    let (light_accounts, _, _) = packed_accounts.to_account_metas();
+
+    // Build rotation key entries and address tree infos
+    let new_keys: Vec<RotationKeyEntry> = new_encrypted_keys
+        .iter()
+        .map(|(member, role, encrypted_aes_key)| RotationKeyEntry {
+            member: member.to_bytes().into(),
+            role: *role,
+            encrypted_aes_key: *encrypted_aes_key,
+        })
+        .collect();
+
+    let address_tree_infos: Vec<PackedAddressTreeInfoCodama> = packed_tree_infos
+        .address_trees
+        .iter()
+        .map(|&info| info.into())
+        .collect();
+
+    let instruction_data = RotateGroupKeyData {
+        discriminator: InstructionType::RotateGroupKey,
+        proof: rpc_result.value.proof.into(),
+        output_state_tree_index: output_merkle_tree_index,
+        group_id,
+        new_keys,
+        address_tree_infos,
+    };
+    let data = RotateGroupKeyData::serialize(&instruction_data)
+        .context("Failed to serialize RotateGroupKeyData")?;
+
+    let mut accounts = vec![
+        light_accounts[0].clone(), // signer
+        AccountMeta::new(group_pda, false),
+        AccountMeta::new_readonly(SYSTEM_PROGRAM_ID, false),
+    ];
+    accounts.extend(light_accounts[1..].iter().cloned());
+
+    Ok(Instruction {
+        program_id: solcrypt_program::ID.into(),
+        accounts,
+        data,
+    })
+}
+
+/// Create and sign a transaction for rotating the group key
+pub async fn create_rotate_group_key_transaction(
+    client: &mut SolcryptClient,
+    group_id: [u8; 32],
+    new_encrypted_keys: Vec<(Pubkey, u8, [u8; 48])>,
+) -> Result<Transaction> {
+    let instruction =
+        build_rotate_group_key_instruction(client, group_id, new_encrypted_keys).await?;
+
+    let compute_budget_ix = ComputeBudgetInstruction::set_compute_unit_limit(1_400_000);
+    let blockhash = client.get_recent_blockhash().await?;
+
+    let transaction = Transaction::new_signed_with_payer(
+        &[compute_budget_ix, instruction],
+        Some(&client.payer.pubkey()),
+        &[&client.payer],
+        blockhash,
+    );
+
+    Ok(transaction)
+}
