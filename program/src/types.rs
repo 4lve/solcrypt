@@ -1,5 +1,8 @@
 use codama::CodamaType;
-use light_sdk_pinocchio::instruction::{CompressedProof, PackedAddressTreeInfo, ValidityProof};
+use light_sdk_pinocchio::instruction::{
+    CompressedProof, PackedAddressTreeInfo, PackedStateTreeInfo, ValidityProof,
+    account_meta::CompressedAccountMeta,
+};
 use wincode::{SchemaRead, SchemaWrite};
 
 // ============================================================================
@@ -71,6 +74,66 @@ impl From<PackedAddressTreeInfo> for PackedAddressTreeInfoCodama {
             address_merkle_tree_pubkey_index: value.address_merkle_tree_pubkey_index,
             address_queue_pubkey_index: value.address_queue_pubkey_index,
             root_index: value.root_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, SchemaWrite, SchemaRead, CodamaType)]
+pub struct PackedStateTreeInfoCodama {
+    pub root_index: u16,
+    pub prove_by_index: bool,
+    pub merkle_tree_pubkey_index: u8,
+    pub queue_pubkey_index: u8,
+    pub leaf_index: u32,
+}
+
+impl From<PackedStateTreeInfoCodama> for PackedStateTreeInfo {
+    fn from(value: PackedStateTreeInfoCodama) -> Self {
+        PackedStateTreeInfo {
+            root_index: value.root_index,
+            prove_by_index: value.prove_by_index,
+            merkle_tree_pubkey_index: value.merkle_tree_pubkey_index,
+            queue_pubkey_index: value.queue_pubkey_index,
+            leaf_index: value.leaf_index,
+        }
+    }
+}
+
+impl From<PackedStateTreeInfo> for PackedStateTreeInfoCodama {
+    fn from(value: PackedStateTreeInfo) -> Self {
+        PackedStateTreeInfoCodama {
+            root_index: value.root_index,
+            prove_by_index: value.prove_by_index,
+            merkle_tree_pubkey_index: value.merkle_tree_pubkey_index,
+            queue_pubkey_index: value.queue_pubkey_index,
+            leaf_index: value.leaf_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, SchemaWrite, SchemaRead, CodamaType)]
+pub struct CompressedAccountMetaCodama {
+    pub tree_info: PackedStateTreeInfoCodama,
+    pub address: [u8; 32],
+    pub output_state_tree_index: u8,
+}
+
+impl From<CompressedAccountMetaCodama> for CompressedAccountMeta {
+    fn from(value: CompressedAccountMetaCodama) -> Self {
+        CompressedAccountMeta {
+            tree_info: value.tree_info.into(),
+            address: value.address,
+            output_state_tree_index: value.output_state_tree_index,
+        }
+    }
+}
+
+impl From<CompressedAccountMeta> for CompressedAccountMetaCodama {
+    fn from(value: CompressedAccountMeta) -> Self {
+        CompressedAccountMetaCodama {
+            tree_info: value.tree_info.into(),
+            address: value.address,
+            output_state_tree_index: value.output_state_tree_index,
         }
     }
 }

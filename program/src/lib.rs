@@ -11,7 +11,7 @@ mod types;
 pub use constants::*;
 pub use error::*;
 pub use instruction::*;
-pub use processor::{get_user_pda, to_custom_error, to_custom_error_u32};
+pub use processor::{get_group_pda, get_user_pda, to_custom_error, to_custom_error_u32};
 pub use state::*;
 pub use types::*;
 
@@ -24,12 +24,20 @@ mod entrypoint {
     };
     use wincode::Deserialize;
 
+    use crate::instruction::AcceptGroupInviteData;
     use crate::instruction::AcceptThreadData;
     use crate::instruction::AddThreadData;
+    use crate::instruction::CreateGroupData;
     use crate::instruction::InitUserData;
     use crate::instruction::InstructionType;
+    use crate::instruction::InviteToGroupData;
+    use crate::instruction::LeaveGroupData;
+    use crate::instruction::RemoveFromGroupData;
     use crate::instruction::RemoveThreadData;
+    use crate::instruction::RotateGroupKeyData;
     use crate::instruction::SendDmMessageData;
+    use crate::instruction::SendGroupMessageData;
+    use crate::instruction::SetMemberRoleData;
     use crate::processor;
 
     entrypoint!(process_instruction);
@@ -87,6 +95,39 @@ mod entrypoint {
             InstructionType::RemoveThread => {
                 let ix_data = deserialize_to_heap::<RemoveThreadData>(instruction_data)?;
                 processor::remove_thread(accounts, ix_data)
+            }
+            // Group chat instructions
+            InstructionType::CreateGroup => {
+                let ix_data = deserialize_to_heap::<CreateGroupData>(instruction_data)?;
+                processor::create_group(accounts, ix_data)
+            }
+            InstructionType::InviteToGroup => {
+                let ix_data = deserialize_to_heap::<InviteToGroupData>(instruction_data)?;
+                processor::invite_to_group(accounts, ix_data)
+            }
+            InstructionType::AcceptGroupInvite => {
+                let ix_data = deserialize_to_heap::<AcceptGroupInviteData>(instruction_data)?;
+                processor::accept_group_invite(accounts, ix_data)
+            }
+            InstructionType::RemoveFromGroup => {
+                let ix_data = deserialize_to_heap::<RemoveFromGroupData>(instruction_data)?;
+                processor::remove_from_group(accounts, ix_data)
+            }
+            InstructionType::LeaveGroup => {
+                let ix_data = deserialize_to_heap::<LeaveGroupData>(instruction_data)?;
+                processor::leave_group(accounts, ix_data)
+            }
+            InstructionType::SetMemberRole => {
+                let ix_data = deserialize_to_heap::<SetMemberRoleData>(instruction_data)?;
+                processor::set_member_role(accounts, ix_data)
+            }
+            InstructionType::RotateGroupKey => {
+                let ix_data = deserialize_to_heap::<RotateGroupKeyData>(instruction_data)?;
+                processor::rotate_group_key(accounts, ix_data)
+            }
+            InstructionType::SendGroupMessage => {
+                let ix_data = deserialize_to_heap::<SendGroupMessageData>(instruction_data)?;
+                processor::send_group_message(accounts, ix_data)
             }
         }
     }
